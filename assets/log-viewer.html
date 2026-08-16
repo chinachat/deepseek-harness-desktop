@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DeepSeek Harness 日志</title>
+<style>
+  body {
+    margin: 0;
+    background: #0f1115;
+    color: #d6dde8;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 8px 12px;
+    background: #1a1d26;
+    border-bottom: 1px solid #2a2e3a;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  header button {
+    background: #2a2e3a;
+    color: #d6dde8;
+    border: 1px solid #3a3f4d;
+    border-radius: 4px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  header button:hover { background: #3a3f4d; }
+  header span { color: #8b93a7; }
+  #log {
+    flex: 1;
+    overflow: auto;
+    padding: 8px 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+<header>
+  <span>dsh-desktop.log</span>
+  <button id="refresh">刷新</button>
+  <button id="autoscroll">自动滚动: 开</button>
+</header>
+<div id="log">加载中…</div>
+<script>
+  let autoScroll = true;
+  const logEl = document.getElementById("log");
+  const refreshBtn = document.getElementById("refresh");
+  const autoBtn = document.getElementById("autoscroll");
+
+  async function refresh() {
+    try {
+      const text = await window.dshLogs.read();
+      logEl.textContent = text;
+      if (autoScroll) logEl.scrollTop = logEl.scrollHeight;
+    } catch (error) {
+      logEl.textContent = "读取日志失败: " + String(error);
+    }
+  }
+
+  refreshBtn.addEventListener("click", refresh);
+  autoBtn.addEventListener("click", () => {
+    autoScroll = !autoScroll;
+    autoBtn.textContent = "自动滚动: " + (autoScroll ? "开" : "关");
+  });
+  logEl.addEventListener("scroll", () => {
+    autoScroll = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 10;
+    autoBtn.textContent = "自动滚动: " + (autoScroll ? "开" : "关");
+  });
+
+  setInterval(refresh, 2000);
+  refresh();
+</script>
+</body>
+</html>
