@@ -6,6 +6,7 @@ import { DshServerManager, type ServerStatus } from "./dsh-server";
 import { createTray, TrayState } from "./tray";
 import { openLogWindow, registerLogIpc } from "./log-window";
 import { registerFileExplorerIpc } from "./file-explorer";
+import { installWebBridge } from "./web-bridge";
 import { applyLaunchAtLogin, getSettings, saveSettings, type AppSettings } from "./settings";
 
 const EXPLORER_WIDTH = 360;
@@ -164,6 +165,12 @@ function createWindow(url: string): void {
   dshView.webContents.once("did-finish-load", () => {
     logger.info(`dsh view loaded: ${dshView?.webContents.getURL()}`);
     void syncTheme();
+  });
+
+  installWebBridge(dshView.webContents, explorerView.webContents, {
+    onWorkspaceRoot: (root) => {
+      logger.info(`workspace root -> ${root ?? "(none)"}`);
+    },
   });
 
   explorerView.webContents.once("did-finish-load", () => {

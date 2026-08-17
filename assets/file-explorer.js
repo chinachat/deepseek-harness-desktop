@@ -505,6 +505,14 @@
     });
   }
 
+  if (ui && ui.onWorkspaceRoot) {
+    ui.onWorkspaceRoot(function (root) {
+      if (root && typeof root === "string" && root !== cur) {
+        loadDir({ dir: root });
+      }
+    });
+  }
+
   resizer.addEventListener("pointerdown", function (e) {
     e.preventDefault();
     var startScreenX = e.screenX;

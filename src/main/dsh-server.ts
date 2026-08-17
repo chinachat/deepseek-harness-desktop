@@ -38,6 +38,10 @@ export class DshServerManager extends EventEmitter {
   private consecutiveFailures = 0;
   private bootTimer: NodeJS.Timeout | undefined;
   private restartTimer: NodeJS.Timeout | undefined;
+  /** Monotonic epoch bumped on every (re)start so stale async callbacks become no-ops. */
+  private epoch = 0;
+  /** Reused in-flight `start()` promise while a launch is in progress (dedupes concurrent starts). */
+  private pendingStart: Promise<string> | undefined;
 
   on<K extends keyof ServerEvents>(event: K, listener: ServerEvents[K]): this {
     return super.on(event, listener as (...args: any[]) => void);
@@ -58,7 +62,21 @@ export class DshServerManager extends EventEmitter {
   }
 
   async start(): Promise<string> {
-    if (this.child) return this.currentUrl!;
+    // Dedupe concurrent launches against a single in-flight promise.
+    if (this.pendingStart) return this.pendingStart;
+    // Already running and holding its URL — idempotent call.
+    if (this.child && this.currentUrl) return this.currentUrl;
+
+    this.pendingStart = this.doStart();
+    try {
+      return await this.pendingStart;
+    } finally {
+      this.pendingStart = undefined;
+    }
+  }
+
+  private async doStart(): Promise<string> {
+    const epoch = ++this.epoch;
     this.stoppedByUs = false;
 
     const bin = resolveDshBin();
@@ -89,8 +107,12 @@ export class DshServerManager extends EventEmitter {
       let stdoutBuf = "";
       let settled = false;
 
+      // A callback is only authoritative for its own launch epoch. When a newer
+      // launch has superseded this one (stop/restart), ignore it entirely.
+      const isCurrent = (): boolean => this.epoch === epoch;
+
       this.bootTimer = setTimeout(() => {
-        if (settled) return;
+        if (!isCurrent() || settled) return;
         settled = true;
         this.handleFailure(new Error(`dsh web did not print its URL within ${BOOT_TIMEOUT_MS}ms`));
         reject(new Error(`dsh web did not print its URL within ${BOOT_TIMEOUT_MS}ms`));
@@ -101,7 +123,7 @@ export class DshServerManager extends EventEmitter {
         this.emit("output", "stdout", text);
         stdoutBuf += text;
         const match = URL_PATTERN.exec(stdoutBuf);
-        if (match && !settled) {
+        if (match && isCurrent() && !settled) {
           settled = true;
           if (this.bootTimer) clearTimeout(this.bootTimer);
           this.consecutiveFailures = 0;
@@ -116,18 +138,18 @@ export class DshServerManager extends EventEmitter {
 
       child.on("error", (error) => {
         this.emit("output", "stderr", `spawn error: ${String(error)}\n`);
-        if (!settled) {
-          settled = true;
-          if (this.bootTimer) clearTimeout(this.bootTimer);
-          this.handleFailure(error);
-          reject(error);
-        }
+        if (!isCurrent() || settled) return;
+        settled = true;
+        if (this.bootTimer) clearTimeout(this.bootTimer);
+        this.handleFailure(error);
+        reject(error);
       });
 
       child.on("exit", (code, signal) => {
         if (this.bootTimer) clearTimeout(this.bootTimer);
         logger.info(`dsh exited code=${code} signal=${signal}`);
         this.emit("exit", code, signal);
+        if (!isCurrent()) return;
         this.child = undefined;
         if (!settled) {
           settled = true;
@@ -166,6 +188,7 @@ export class DshServerManager extends EventEmitter {
 
   stop(): void {
     this.stoppedByUs = true;
+    this.epoch += 1; // invalidate any in-flight launch callbacks
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = undefined;
@@ -174,24 +197,34 @@ export class DshServerManager extends EventEmitter {
       clearTimeout(this.bootTimer);
       this.bootTimer = undefined;
     }
-    if (this.child && !this.child.killed) {
+    const child = this.child;
+    this.child = undefined;
+    if (child && !child.killed) {
       logger.info("stopping dsh");
-      this.child.kill();
+      child.kill();
     }
+    this.pendingStart = undefined;
+    this.currentUrl = undefined;
     this.setStatus("stopped");
   }
 
   restart(): void {
     this.stoppedByUs = true;
+    this.epoch += 1; // invalidate any in-flight launch callbacks
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = undefined;
     }
+    if (this.bootTimer) {
+      clearTimeout(this.bootTimer);
+      this.bootTimer = undefined;
+    }
     const child = this.child;
+    this.child = undefined;
     if (child && !child.killed) {
       child.kill();
     }
-    this.child = undefined;
+    this.pendingStart = undefined;
     this.currentUrl = undefined;
     this.consecutiveFailures = 0;
     this.stoppedByUs = false;

@@ -12,5 +12,8 @@ contextBridge.exposeInMainWorld("dshDesktop", {
     onState: (cb: (state: { collapsed: boolean; width: number }) => void) => {
       ipcRenderer.on("dsh-explorer:state", (_event, state) => cb(state));
     },
+    onWorkspaceRoot: (cb: (root: string | null) => void) => {
+      ipcRenderer.on("dsh-explorer:workspace-root", (_event, root) => cb(root));
+    },
   },
 });
