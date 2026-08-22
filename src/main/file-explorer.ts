@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, shell } from "electron";
 import fsp from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -146,5 +146,18 @@ export function registerFileExplorerIpc(): void {
       drives.push({ name: "/", path: "/" });
     }
     return drives;
+  });
+
+  /**
+   * Open a file with the OS default application (e.g. a PDF in the PDF
+   * viewer). Only usable from the explorer pane; path traversal is rejected
+   * the same way as `dsh-fs:read`.
+   */
+  ipcMain.handle("dsh-fs:open", async (_event, payload: ReadPayload = {}) => {
+    const base = resolveBase(payload.dir);
+    if (!validSegment(payload.name)) throw new Error("invalid path segment");
+    const resolved = path.join(base, payload.name);
+    const errorMessage = await shell.openPath(resolved);
+    return { ok: errorMessage === "", error: errorMessage || null };
   });
 }

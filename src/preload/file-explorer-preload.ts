@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("dshDesktop", {
   fs: {
     list: (payload: unknown) => ipcRenderer.invoke("dsh-fs:list", payload),
     read: (payload: unknown) => ipcRenderer.invoke("dsh-fs:read", payload),
+    open: (payload: unknown) => ipcRenderer.invoke("dsh-fs:open", payload),
     drives: () => ipcRenderer.invoke("dsh-fs:drives"),
   },
   ui: {

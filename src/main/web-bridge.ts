@@ -68,10 +68,58 @@ function listWindowsDrives(): string[] {
   return drives;
 }
 
-/** Active workspace root from the persisted registry, or null. */
+/**
+ * Active workspace root from the persisted dsh session registry.
+ *
+ * Priority:
+ *  1. The most recently active session's `cwd` (session_projcache.json →
+ *     tables.sessions.<id>.identity.cwd, ranked by
+ *     sessionListMetadata.lastPromptAt) — this tracks the conversation the
+ *     user is currently working in.
+ *  2. Fallback: the most recently updated workspace (workspace.json →
+ *     tables.workspaces.<id>.path by updatedAt).
+ */
 function readWorkspaceRoot(): string | null {
+  const home = app.getPath("home");
+
+  // 1. Most recently active session's cwd.
   try {
-    const file = path.join(app.getPath("home"), ".dsh", "storages", "workspace.json");
+    const file = path.join(home, ".dsh", "storages", "session_projcache.json");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      tables?: {
+        sessions?: Record<
+          string,
+          {
+            identity?: { cwd?: unknown };
+            rows?: {
+              sessionListMetadata?: { val?: { lastPromptAt?: unknown } };
+            };
+          }
+        >;
+      };
+    };
+    const sessions = parsed?.tables?.sessions ?? {};
+    let bestCwd: string | null = null;
+    let bestActive = -1;
+    for (const id of Object.keys(sessions)) {
+      const s = sessions[id];
+      const cwd = s?.identity?.cwd;
+      if (typeof cwd !== "string" || cwd === "") continue;
+      const t = Date.parse(String(s?.rows?.sessionListMetadata?.val?.lastPromptAt ?? ""));
+      const ts = Number.isFinite(t) ? t : 0;
+      if (bestCwd === null || ts > bestActive) {
+        bestCwd = cwd;
+        bestActive = ts;
+      }
+    }
+    if (bestCwd) return path.resolve(bestCwd);
+  } catch {
+    /* fall through to workspace registry */
+  }
+
+  // 2. Most recently updated workspace.
+  try {
+    const file = path.join(home, ".dsh", "storages", "workspace.json");
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
       tables?: { workspaces?: Record<string, { path?: unknown; updatedAt?: unknown }> };
     };
@@ -88,10 +136,12 @@ function readWorkspaceRoot(): string | null {
         bestUpdated = ts;
       }
     }
-    return bestPath ? path.resolve(bestPath) : null;
+    if (bestPath) return path.resolve(bestPath);
   } catch {
-    return null;
+    /* no persisted workspace */
   }
+
+  return null;
 }
 
 /** Serialize for an inline <script>-style value into the target page. */

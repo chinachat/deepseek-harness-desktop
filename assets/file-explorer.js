@@ -384,6 +384,14 @@
           if (entry.type === "directory") loadDir({ dir: cur, name: entry.name });
           else openFile({ dir: cur, name: entry.name });
         };
+        item.ondblclick = function () {
+          // 双击:目录进入;文件用系统默认程序打开(适合无法预览的二进制/文档等)。
+          if (entry.type === "directory") {
+            loadDir({ dir: cur, name: entry.name });
+            return;
+          }
+          openWithSystem({ dir: cur, name: entry.name });
+        };
       })(e);
       tree.appendChild(item);
     }
@@ -489,6 +497,21 @@
 
   function isMarkdown(p) { return /\.(md|markdown|mdown)$/i.test(String(p || "")); }
   function isImage(p) { return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(String(p || "")); }
+
+  function openWithSystem(payload) {
+    if (!fs || !fs.open) return;
+    fs.open(payload).then(function (res) {
+      if (res && !res.ok) {
+        var note = h("div", "dfe-note", "系统打开失败: " + (res.error || "未知错误"));
+        viewPanel.textContent = "";
+        viewPanel.appendChild(note);
+      }
+    }).catch(function (e) {
+      var note = h("div", "dfe-note", "系统打开失败: " + String((e && e.message) || e));
+      viewPanel.textContent = "";
+      viewPanel.appendChild(note);
+    });
+  }
 
   collapseBtn.onclick = function () { if (ui) ui.toggle(); };
   expandBtn.onclick = function () { if (ui) ui.toggle(); };
