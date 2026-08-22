@@ -82,7 +82,7 @@ export class UpdateManager extends EventEmitter {
 
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
-    // The app version is a pre-release (0.1.0); allow fetching pre-releases.
+    // The app version is a pre-release (0.1.1-rc.2); allow fetching pre-releases.
     autoUpdater.allowPrerelease = true;
 
     // This project ships unsigned installers (no code-signing certificate).
