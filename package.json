@@ -33,6 +33,7 @@
     "@deepseek-ai/dsh-subprocess": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-timeout": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-workflow": "^0.1.1-rc.2",
+    "electron-updater": "^6.8.9",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
@@ -50,6 +51,13 @@
       "output": "release",
       "buildResources": "build"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "chinachat",
+        "repo": "deepseek-harness-desktop"
+      }
+    ],
     "files": [
       "dist/**/*",
       "assets/**/*",

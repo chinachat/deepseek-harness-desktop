@@ -5,8 +5,10 @@ import { initLogger, logger } from "./logger";
 import { DshServerManager, type ServerStatus } from "./dsh-server";
 import { createTray, TrayState } from "./tray";
 import { openLogWindow, registerLogIpc } from "./log-window";
+import { openSettingsWindow, registerSettingsIpc } from "./settings-window";
 import { registerFileExplorerIpc } from "./file-explorer";
 import { installWebBridge } from "./web-bridge";
+import { UpdateManager } from "./updater";
 import { applyLaunchAtLogin, getSettings, saveSettings, type AppSettings } from "./settings";
 
 const EXPLORER_WIDTH = 360;
@@ -243,6 +245,7 @@ async function bootstrap(): Promise<void> {
   tray = createTray({
     onOpen: focusMainWindow,
     onLogs: () => openLogWindow(),
+    onSettings: () => openSettingsWindow(),
     onRestart: () => serverManager?.restart(),
     onQuit: () => {
       isQuitting = true;
@@ -260,6 +263,9 @@ async function bootstrap(): Promise<void> {
   const settings = getSettings();
   applyLaunchAtLogin(settings.launchAtLogin);
   if (tray) tray.refreshSettings(settings);
+
+  // Init the update manager so the GitHub proxy applies before any check.
+  UpdateManager.get().init(settings.githubProxy);
 
   try {
     await serverManager.start();
@@ -280,6 +286,7 @@ if (!gotLock) {
     initLogger();
     Menu.setApplicationMenu(null);
     registerLogIpc();
+    registerSettingsIpc();
     registerFileExplorerIpc();
     registerExplorerUiIpc();
     logger.info("app starting");

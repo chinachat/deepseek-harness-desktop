@@ -49,6 +49,21 @@ npm run pack
 
 > 注意：打包为 NSIS 时若内存不足，可设置 `NODE_OPTIONS=--max-old-space-size=4096` 避免 OOM。
 
+## 在线升级
+
+应用内置在线升级（electron-updater + GitHub Releases）：
+
+- **升级源**：`https://github.com/chinachat/deepseek-harness-desktop/releases`（`publish.github` 配置）。
+- **检查方式**：托盘「设置…」→「检查更新」，或直接打开设置窗口。下载进度实时显示，下载完成后可一键重启安装。
+- **代理配置**：网络受限时，在设置窗口填写 GitHub 代理（如 `http://127.0.0.1:7890`）即可，升级请求会经该代理走 GitHub。
+- **发布新版本**：打标签发布时，用 `GH_TOKEN` 环境变量将产物上传到 GitHub Releases：
+
+  ```bash
+  GH_TOKEN=<your-token> npm run dist -- --publish always
+  ```
+
+  electron-builder 会把安装包和 `latest.yml` 一起发布，用户端即可检测到更新。
+
 ## 项目结构
 
 ```

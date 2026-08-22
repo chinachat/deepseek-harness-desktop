@@ -12,6 +12,7 @@ export interface TrayState {
 export interface TrayActions {
   onOpen: () => void;
   onLogs: () => void;
+  onSettings: () => void;
   onRestart: () => void;
   onQuit: () => void;
   getSettings: () => AppSettings;
@@ -62,7 +63,11 @@ export function createTray(actions: TrayActions): TrayState {
       { label: "重启服务", click: () => actions.onRestart() },
       { type: "separator" },
       {
-        label: "设置",
+        label: "设置…",
+        click: () => actions.onSettings(),
+      },
+      {
+        label: "偏好设置",
         submenu: [loginItem, closeToTrayItem],
       },
       { type: "separator" },
