@@ -360,12 +360,13 @@ const INSTALL_SCRIPT = `
 
   function ensurePickButton() {
     if (document.getElementById(PICK_BTN_ID)) return true;
-    // The composer input bar is the attachment home. Anchor to the textarea's
-    // scroll container (a stable data attribute) and place the button in the
-    // tool row below it; fall back to the textarea's ancestor if it moves.
-    const textarea = document.querySelector("textarea");
-    if (!textarea) return false;
-    const anchor = textarea.closest("[data-input-scroll]") || textarea.closest("form") || textarea.parentElement;
+    // The composer input is the attachment home. Anchor to the composer box:
+    // dsh ≤0.1.1 used a <textarea>; dsh ≥0.1.2-rc.1 switched to a
+    // contenteditable ([role="textbox"][contenteditable]). Handle both.
+    const input = document.querySelector('textarea')
+      || document.querySelector('[role="textbox"][contenteditable], [contenteditable="true"][role="textbox"], div[contenteditable="true"]');
+    if (!input) return false;
+    const anchor = input.closest("[data-input-scroll]") || input.closest("form") || input.parentElement;
     if (!anchor || !anchor.parentElement) return false;
 
     const btn = document.createElement("button");
