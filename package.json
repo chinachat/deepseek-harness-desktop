@@ -1,12 +1,13 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "DeepSeek Harness desktop GUI",
   "main": "dist/main/main.js",
   "author": "dsh-desktop",
   "license": "MIT",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "postinstall": "node scripts/patch-dsh-win32.mjs",
+    "build": "node scripts/patch-dsh-win32.mjs && tsc -p tsconfig.json",
     "start": "npm run build && electron .",
     "dev": "electron .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
