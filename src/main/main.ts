@@ -41,11 +41,40 @@ function showError(message: string): void {
   app.quit();
 }
 
-function isReady(url: string): Promise<boolean> {
+/** Origin of a URL, or `""` when it cannot be parsed. */
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Probe the announced URL, token included, and follow its redirect.
+ *
+ * The token is not optional. The browser-trust fence answers `GET /` without one
+ * with 401 ("dsh web authentication required"), so probing the bare origin can
+ * never see 200 and would report a healthy server as dead — which is exactly
+ * how the UI used to time out after 30s while the server was fine.
+ *
+ * The first hop answers 303 and sets the session cookie; the cookie has to be
+ * replayed on the redirect target, because the cookie is what carries the trust
+ * forward. Node's plain `http.get` has no cookie jar, so it is threaded by hand.
+ */
+function isReady(url: string, cookie?: string, redirectsLeft = 3): Promise<boolean> {
   return new Promise((resolve) => {
-    const req = http.get(url, (res) => {
+    const options = cookie ? { headers: { cookie } } : {};
+    const req = http.get(url, options, (res) => {
       res.resume();
-      resolve(res.statusCode === 200);
+      const status = res.statusCode ?? 0;
+      const location = res.headers.location;
+      const setCookie = res.headers["set-cookie"]?.[0]?.split(";")[0];
+      if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
+        resolve(isReady(new URL(location, url).href, setCookie ?? cookie, redirectsLeft - 1));
+        return;
+      }
+      resolve(status === 200);
     });
     req.setTimeout(2000, () => {
       req.destroy();
@@ -186,6 +215,10 @@ function createWindow(url: string): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Dedicated session: the dsh UI authenticates by exchanging its token for
+      // a cookie, and it must not share a cookie jar with our own pages (nor
+      // inherit one left behind by a previous run).
+      partition: "persist:dsh-web",
     },
   });
 
@@ -211,7 +244,10 @@ function createWindow(url: string): void {
   );
 
   recoverOnCrash(dshView, "dsh view", () => {
-    if (serverManager) void dshView?.webContents.loadURL(url);
+    // Reload the announced URL, token included, so recovery does not depend on
+    // a session cookie surviving the crash.
+    const current = serverManager?.getState().url ?? url;
+    void dshView?.webContents.loadURL(current);
   });
   recoverOnCrash(explorerView, "explorer view", () => {
     void explorerView?.webContents.loadFile(explorerUrl);
@@ -314,8 +350,12 @@ function onServerStatus(status: ServerStatus, url?: string): void {
     // so a stale reference here would crash the main process.
     const view = dshView;
     if (view && !view.webContents.isDestroyed()) {
+      // Compare origins, not the full URL: the token is minted per process, so
+      // a restart always changes the query string and a string comparison would
+      // reload the view on every status event.
       const current = view.webContents.getURL();
-      if (current === "" || !current.startsWith(url)) void view.webContents.loadURL(url);
+      const sameOrigin = current !== "" && originOf(current) === originOf(url);
+      if (!sameOrigin) void view.webContents.loadURL(url);
     }
   }
 }

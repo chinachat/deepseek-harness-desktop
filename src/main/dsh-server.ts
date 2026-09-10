@@ -13,7 +13,17 @@ export interface ServerEvents {
   exit: (code: number | null, signal: string | null) => void;
 }
 
-const URL_PATTERN = /dsh web: (http:\/\/127\.0\.0\.1:\d+)/;
+/**
+ * The announce line, e.g.
+ *   `dsh web: http://127.0.0.1:52341/?token=… (LAN: http://…/?token=…)`
+ *
+ * The whole URL is kept, token included. Since dsh 0.1.5 the browser-trust
+ * fence rejects `GET /` without a token (401 "dsh web authentication
+ * required"), so a bare origin is not a usable handle on the UI: the token is
+ * what exchanges for the session cookie.
+ */
+const URL_PATTERN = /dsh web: (http:\/\/127\.0\.0\.1:\d+\S*)/;
+
 const BOOT_TIMEOUT_MS = 90_000;
 const RESTART_DELAY_MS = 3_000;
 const MAX_CONSECUTIVE_RESTARTS = 3;

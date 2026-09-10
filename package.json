@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "DeepSeek Harness desktop GUI",
   "main": "dist/main/main.js",
   "author": "dsh-desktop",
