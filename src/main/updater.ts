@@ -36,6 +36,8 @@ export class UpdateManager extends EventEmitter {
 
   private initialized = false;
   private checking = false;
+  /** True between update-available and download completion/error. */
+  private downloading = false;
   private currentState: UpdateState = { phase: "idle" };
 
   static get(): UpdateManager {
@@ -103,10 +105,14 @@ export class UpdateManager extends EventEmitter {
     });
 
     autoUpdater.on("update-available", (info) => {
+      this.downloading = true;
       this.setState({ phase: "available", version: info.version });
     });
 
     autoUpdater.on("update-not-available", (info) => {
+      // Do not regress a download that is already running: two overlapping
+      // checks can deliver this after update-available.
+      if (this.downloading) return;
       this.setState({ phase: "not-available", version: info.version });
     });
 
@@ -119,11 +125,14 @@ export class UpdateManager extends EventEmitter {
     });
 
     autoUpdater.on("update-downloaded", (event) => {
+      this.downloading = false;
       this.setState({ phase: "downloaded", version: event.version });
     });
 
     autoUpdater.on("error", (error) => {
-      this.checking = false;
+      this.downloading = false;
+      // `checking` is owned by check()'s finally block. Clearing it here races
+      // a newer check and lets a second one start underneath the first.
       this.setState({ phase: "error", message: String(error?.message ?? error) });
     });
   }
@@ -137,12 +146,13 @@ export class UpdateManager extends EventEmitter {
     this.checking = true;
     try {
       const result = await autoUpdater.checkForUpdates();
-      if (result === null) {
+      if (result === null && !this.downloading) {
         this.setState({ phase: "not-available", version: this.currentVersion() });
       }
       // When autoDownload is true, download starts automatically and progress
       // events follow; nothing more to do here.
     } catch (error) {
+      this.downloading = false;
       this.setState({ phase: "error", message: String((error as Error)?.message ?? error) });
     } finally {
       this.checking = false;

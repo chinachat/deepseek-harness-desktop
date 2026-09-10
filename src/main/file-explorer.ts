@@ -1,7 +1,8 @@
-import { ipcMain, shell } from "electron";
+import { app, ipcMain, shell } from "electron";
 import fsp from "node:fs/promises";
-import { homedir } from "node:os";
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { guardFilePage } from "./ipc-guard";
 
 const MAX_READ_BYTES = 1_000_000;
 const MAX_READ_CHARS = 400_000;
@@ -18,19 +19,102 @@ const IMAGE_MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
 };
 
-function resolveBase(dir?: string): string {
-  const raw = dir && dir.trim() ? dir : defaultProjectDir();
+/**
+ * Extensions the OS "open" verb is allowed to handle.
+ *
+ * `shell.openPath` is a code-execution primitive: on Windows it runs the shell
+ * open verb, so `.exe`, `.bat`, `.cmd`, `.ps1`, `.scr` and `.msi` execute, and
+ * a `.lnk`/`.url` redirects to anything without carrying a Mark-of-the-Web flag
+ * (so SmartScreen does not stop it). Only document/image/media types that a
+ * file browser plausibly previews are admitted.
+ */
+const OPENABLE_EXTENSIONS = new Set([
+  ".pdf",
+  ".txt", ".log", ".csv", ".tsv", ".ini", ".cfg", ".conf", ".env",
+  ".md", ".markdown", ".rst", ".adoc",
+  ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".tif", ".tiff",
+  ".mp3", ".wav", ".flac", ".m4a", ".mp4", ".mkv", ".webm", ".mov", ".avi",
+  ".zip", ".7z", ".gz", ".tar", ".rar",
+  ".json", ".xml", ".yml", ".yaml", ".html", ".htm", ".css", ".js", ".ts",
+]);
+
+/**
+ * Directories the renderer is permitted to read.
+ *
+ * The explorer is a user-facing file browser, so its reach is intentionally
+ * broad; the point of this set is that a root must be claimed explicitly by a
+ * navigation request rooted at that directory (which is exactly what the drive
+ * dropdown and the workspace-root push do), rather than any absolute path in a
+ * payload being silently honoured. Containment is then re-checked against the
+ * *real* path so a symlink cannot escape a claimed root.
+ */
+const allowedRoots = new Set<string>();
+
+/**
+ * Permit a directory tree explicitly, without a renderer request. Used for the
+ * roots the app itself decides on — the user's home (the default browse root)
+ * and the workspace the explorer is asked to follow.
+ */
+export function allowRoot(dir: string): void {
+  try {
+    allowedRoots.add(realpathSync.native(dir));
+  } catch {
+    /* not a real directory; nothing to permit */
+  }
+}
+
+function normalizeDir(raw: string): string {
+  // `path.resolve("C:")` means "the current directory on drive C:", which is
+  // unrelated to the drive root and inconsistent with how a caller reads it.
+  // Treat a bare drive designator as its root.
+  const driveOnly = /^([A-Za-z]):$/.exec(raw.trim());
+  if (driveOnly) return `${driveOnly[1].toUpperCase()}:\\`;
   return path.resolve(raw);
 }
 
 function defaultProjectDir(): string {
   try {
     const cwd = process.cwd();
-    if (cwd && cwd.trim().length > 0) return cwd;
+    // A packaged app launched from a shortcut inherits an unrelated cwd
+    // (system32 on Windows); the user's home is the honest fallback.
+    if (cwd && cwd.trim().length > 0 && app.isPackaged === false) return cwd;
   } catch {
     /* fall through */
   }
-  return homedir();
+  return app.getPath("home");
+}
+
+function isContained(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+async function confineExisting(input: string): Promise<string> {
+  // realpath resolves symlinks and junctions, so containment is evaluated on
+  // the real location rather than the path the caller typed.
+  const real = await fsp.realpath(input);
+  for (const root of allowedRoots) {
+    if (isContained(root, real)) return real;
+  }
+  throw new Error(`path outside the permitted roots: ${real}`);
+}
+
+/**
+ * Resolve the base directory of a request, claiming it as an allowed root.
+ *
+ * A root is only ever claimed by naming it as the base (`dir`) of a request,
+ * which is how the published explorer UI navigates: the drive dropdown, the
+ * `..` button and the workspace-root watcher all send the target directory as
+ * `dir`. Nothing else can widen the set — `name` is validated as a single
+ * segment, and `read`/`open` are confined to roots already claimed.
+ */
+async function resolveBase(dir?: string): Promise<string> {
+  const raw = dir && dir.trim() ? dir : defaultProjectDir();
+  const base = normalizeDir(raw);
+  const real = await fsp.realpath(base);
+  allowedRoots.add(real);
+  return real;
 }
 
 /**
@@ -81,14 +165,18 @@ async function readText(resolved: string, size: number): Promise<{ kind: "binary
 }
 
 export function registerFileExplorerIpc(): void {
-  ipcMain.handle("dsh-fs:list", async (_event, payload: ListPayload = {}) => {
-    const base = resolveBase(payload.dir);
-    const resolved = validSegment(payload.name) ? path.join(base, payload.name) : base;
+  ipcMain.handle("dsh-fs:list", async (event, payload: ListPayload = {}) => {
+    guardFilePage(event);
+    const base = await resolveBase(payload.dir);
+    const target = validSegment(payload.name) ? path.join(base, payload.name) : base;
+    const resolved = await confineExisting(target);
     const dirents = await fsp.readdir(resolved, { withFileTypes: true });
     const entries: { name: string; type: string; size: number | null }[] = [];
     for (const d of dirents) {
       let type = "file";
       let size: number | null = null;
+      // lstat semantics: a symlink is reported as its own kind rather than
+      // silently standing in for whatever it points at.
       if (d.isDirectory()) type = "directory";
       else if (d.isSymbolicLink()) type = "other";
       if (type === "file") {
@@ -109,10 +197,12 @@ export function registerFileExplorerIpc(): void {
     return { path: resolved, parent: path.dirname(resolved), entries };
   });
 
-  ipcMain.handle("dsh-fs:read", async (_event, payload: ReadPayload = {}) => {
-    const base = resolveBase(payload.dir);
+  ipcMain.handle("dsh-fs:read", async (event, payload: ReadPayload = {}) => {
+    guardFilePage(event);
+    const base = await resolveBase(payload.dir);
     if (!validSegment(payload.name)) throw new Error("invalid path segment");
-    const resolved = path.join(base, payload.name);
+    const resolved = await confineExisting(path.join(base, payload.name));
+    // stat (not lstat) after confineExisting: the realpath check already ran.
     const st = await fsp.stat(resolved);
     if (st.isDirectory()) return { path: resolved, kind: "directory", size: st.size };
 
@@ -129,7 +219,8 @@ export function registerFileExplorerIpc(): void {
     return { path: resolved, ...text };
   });
 
-  ipcMain.handle("dsh-fs:drives", async () => {
+  ipcMain.handle("dsh-fs:drives", async (event) => {
+    guardFilePage(event);
     const drives: { name: string; path: string }[] = [];
     if (process.platform === "win32") {
       for (let code = 65; code <= 90; code += 1) {
@@ -150,13 +241,18 @@ export function registerFileExplorerIpc(): void {
 
   /**
    * Open a file with the OS default application (e.g. a PDF in the PDF
-   * viewer). Only usable from the explorer pane; path traversal is rejected
-   * the same way as `dsh-fs:read`.
+   * viewer). Restricted to the explorer pane, to a claimed root, and to
+   * document/media extensions — never an executable or a shortcut.
    */
-  ipcMain.handle("dsh-fs:open", async (_event, payload: ReadPayload = {}) => {
-    const base = resolveBase(payload.dir);
+  ipcMain.handle("dsh-fs:open", async (event, payload: ReadPayload = {}) => {
+    guardFilePage(event);
+    const base = await resolveBase(payload.dir);
     if (!validSegment(payload.name)) throw new Error("invalid path segment");
-    const resolved = path.join(base, payload.name);
+    const resolved = await confineExisting(path.join(base, payload.name));
+    const ext = path.extname(resolved).toLowerCase();
+    if (!OPENABLE_EXTENSIONS.has(ext)) {
+      return { ok: false, error: `出于安全考虑，不通过系统默认程序打开 ${ext || "无扩展名的"} 文件` };
+    }
     const errorMessage = await shell.openPath(resolved);
     return { ok: errorMessage === "", error: errorMessage || null };
   });

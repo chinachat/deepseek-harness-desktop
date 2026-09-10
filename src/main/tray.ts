@@ -1,4 +1,4 @@
-import { Menu, Tray, nativeImage } from "electron";
+import { app, Menu, Tray, nativeImage } from "electron";
 import path from "node:path";
 import type { ServerStatus } from "./dsh-server";
 import type { AppSettings } from "./settings";
@@ -27,7 +27,13 @@ const STATUS_LABEL: Record<ServerStatus, string> = {
 };
 
 export function createTray(actions: TrayActions): TrayState {
-  const icon = nativeImage.createFromPath(path.join(__dirname, "..", "..", "assets", "tray.png"));
+  // Resolve assets from the bundle root rather than from `__dirname`, so an
+  // outDir or asar change cannot silently produce an empty image.
+  const iconPath = path.join(app.getAppPath(), "assets", "tray.png");
+  const icon = nativeImage.createFromPath(iconPath);
+  if (icon.isEmpty()) {
+    console.warn(`[tray] icon not found at ${iconPath}; the tray entry will be invisible`);
+  }
   const tray = new Tray(icon);
   tray.setToolTip("DeepSeek Harness");
 

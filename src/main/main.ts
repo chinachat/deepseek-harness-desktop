@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, WebContentsView } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell, WebContentsView, type WebContents } from "electron";
 import http from "node:http";
 import path from "node:path";
 import { initLogger, logger } from "./logger";
@@ -6,8 +6,9 @@ import { DshServerManager, type ServerStatus } from "./dsh-server";
 import { createTray, TrayState } from "./tray";
 import { openLogWindow, registerLogIpc } from "./log-window";
 import { openSettingsWindow, registerSettingsIpc } from "./settings-window";
-import { registerFileExplorerIpc } from "./file-explorer";
+import { registerFileExplorerIpc, allowRoot } from "./file-explorer";
 import { installWebBridge } from "./web-bridge";
+import { guardFilePage, setWebViewOrigin } from "./ipc-guard";
 import { UpdateManager } from "./updater";
 import { applyLaunchAtLogin, getSettings, saveSettings, type AppSettings } from "./settings";
 
@@ -15,6 +16,8 @@ const EXPLORER_WIDTH = 360;
 const COLLAPSED_WIDTH = 28;
 const MIN_EXPLORER_WIDTH = 220;
 const MAX_EXPLORER_WIDTH = 700;
+/** Minimum width the dsh view keeps; the explorer never grows past this. */
+const MIN_DSH_VIEW_WIDTH = 200;
 
 let mainWindow: BrowserWindow | null = null;
 let dshView: WebContentsView | null = null;
@@ -25,6 +28,8 @@ let isQuitting = false;
 const startHidden = process.argv.includes("--hidden");
 let lastThemeDark: boolean | undefined;
 let themeSyncTimer: NodeJS.Timeout | null = null;
+/** Disposer for the dsh-page bridge; every window owns exactly one. */
+let disposeWebBridge: (() => void) | null = null;
 let explorerWidth = EXPLORER_WIDTH;
 let explorerCollapsed = false;
 
@@ -59,11 +64,21 @@ async function waitForReady(url: string): Promise<void> {
   throw new Error(`web UI did not become ready at ${url}`);
 }
 
+/**
+ * Keep the effective explorer width in one place so a drag reports the same
+ * number the layout actually applied.
+ */
+function effectiveExplorerWidth(): number {
+  if (!mainWindow || !dshView || !explorerView) return explorerWidth;
+  const [width] = mainWindow.getContentSize();
+  const requested = explorerCollapsed ? COLLAPSED_WIDTH : explorerWidth;
+  return Math.min(requested, Math.max(0, width - MIN_DSH_VIEW_WIDTH));
+}
+
 function layout(): void {
   if (!mainWindow || !dshView || !explorerView) return;
   const [width, height] = mainWindow.getContentSize();
-  let explorerW = explorerCollapsed ? COLLAPSED_WIDTH : explorerWidth;
-  explorerW = Math.min(explorerW, Math.max(0, width - 200));
+  const explorerW = effectiveExplorerWidth();
   const mainW = Math.max(0, width - explorerW);
   dshView.setBounds({ x: 0, y: 0, width: mainW, height });
   explorerView.setBounds({ x: mainW, y: 0, width: explorerW, height });
@@ -71,22 +86,80 @@ function layout(): void {
 }
 
 function pushExplorerState(): void {
-  if (!explorerView) return;
+  if (!explorerView || explorerView.webContents.isDestroyed()) return;
   explorerView.webContents.send("dsh-explorer:state", {
     collapsed: explorerCollapsed,
-    width: explorerCollapsed ? COLLAPSED_WIDTH : explorerWidth,
+    width: effectiveExplorerWidth(),
+  });
+}
+
+/**
+ * Confine a view to the origins it is meant to display.
+ *
+ * `contextBridge` installs from `webPreferences`, not from the loaded URL, so a
+ * view that navigates off-origin would carry its whole preload surface to the
+ * new page. External links are handed to the OS browser instead.
+ */
+function hardenView(view: WebContentsView, allowed: (url: URL) => boolean, label: string): void {
+  const contents = view.webContents;
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:$/.test(safeProtocol(url))) {
+      void shell.openExternal(url).catch((error) => logger.warn(`openExternal failed: ${String(error)}`));
+    }
+    return { action: "deny" };
+  });
+  contents.on("will-navigate", (event, target) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(target);
+    } catch {
+      event.preventDefault();
+      return;
+    }
+    if (allowed(parsed)) return;
+    logger.info(`${label}: blocked navigation to ${parsed.origin}`);
+    event.preventDefault();
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      void shell.openExternal(target).catch((error) => logger.warn(`openExternal failed: ${String(error)}`));
+    }
+  });
+}
+
+function safeProtocol(url: string): string {
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return "";
+  }
+}
+
+/** Reload a view whose renderer died, instead of leaving a blank pane. */
+function recoverOnCrash(view: WebContentsView, label: string, reload: () => void): void {
+  view.webContents.on("render-process-gone", (_event, details) => {
+    logger.error(`${label} renderer gone: ${details.reason} (exitCode=${details.exitCode})`);
+    if (isQuitting) return;
+    setTimeout(() => {
+      if (isQuitting || view.webContents.isDestroyed()) return;
+      reload();
+    }, 1000);
+  });
+  view.webContents.on("unresponsive", () => {
+    logger.warn(`${label} renderer unresponsive`);
   });
 }
 
 async function syncTheme(): Promise<void> {
   if (!dshView || !explorerView) return;
+  const dshContents = dshView.webContents;
+  const explorerContents = explorerView.webContents;
+  if (dshContents.isDestroyed() || explorerContents.isDestroyed()) return;
   try {
-    const dark = await dshView.webContents.executeJavaScript(
+    const dark = await dshContents.executeJavaScript(
       "document.body.hasAttribute('data-ds-dark-theme')"
     );
     if (dark !== lastThemeDark) {
       lastThemeDark = dark as boolean;
-      await explorerView.webContents.executeJavaScript(
+      await explorerContents.executeJavaScript(
         `document.body.toggleAttribute('data-ds-dark-theme', ${dark as boolean});`
       );
     }
@@ -103,7 +176,7 @@ function createWindow(url: string): void {
     minHeight: 600,
     title: "DeepSeek Harness",
     backgroundColor: "#0f1115",
-    icon: path.join(__dirname, "..", "..", "assets", "icon.png"),
+    icon: path.join(app.getAppPath(), "assets", "icon.png"),
     show: false,
   });
 
@@ -123,6 +196,25 @@ function createWindow(url: string): void {
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+
+  const explorerUrl = path.join(app.getAppPath(), "assets", "file-explorer.html");
+  const dshOrigin = new URL(url).origin;
+
+  // The dsh view may only ever show the local server it was started for.
+  hardenView(dshView, (target) => target.origin === dshOrigin, "dsh view");
+  // Our own pages may only navigate between bundled file: pages.
+  hardenView(
+    explorerView,
+    (target) => target.protocol === "file:" && target.pathname.endsWith(".html"),
+    "explorer view"
+  );
+
+  recoverOnCrash(dshView, "dsh view", () => {
+    if (serverManager) void dshView?.webContents.loadURL(url);
+  });
+  recoverOnCrash(explorerView, "explorer view", () => {
+    void explorerView?.webContents.loadFile(explorerUrl);
   });
 
   mainWindow.contentView.addChildView(dshView);
@@ -154,6 +246,8 @@ function createWindow(url: string): void {
       clearInterval(themeSyncTimer);
       themeSyncTimer = null;
     }
+    disposeWebBridge?.();
+    disposeWebBridge = null;
     lastThemeDark = undefined;
     mainWindow = null;
     dshView = null;
@@ -165,18 +259,21 @@ function createWindow(url: string): void {
   });
 
   dshView.webContents.once("did-finish-load", () => {
-    logger.info(`dsh view loaded: ${dshView?.webContents.getURL()}`);
+    logger.info("dsh view loaded");
     void syncTheme();
   });
 
-  installWebBridge(dshView.webContents, explorerView.webContents, {
+  disposeWebBridge = installWebBridge(dshView.webContents, explorerView.webContents, {
     onWorkspaceRoot: (root) => {
+      // Claim the followed root up front: the explorer navigates there by
+      // itself, and containment must not reject the app's own choice.
+      if (root) allowRoot(root);
       logger.info(`workspace root -> ${root ?? "(none)"}`);
     },
   });
 
   explorerView.webContents.once("did-finish-load", () => {
-    logger.info(`explorer view loaded: ${explorerView?.webContents.getURL()}`);
+    logger.info("explorer view loaded");
     pushExplorerState();
     void syncTheme();
   });
@@ -186,7 +283,7 @@ function createWindow(url: string): void {
   }, 800);
 
   void dshView.webContents.loadURL(url);
-  void explorerView.webContents.loadFile(path.join(app.getAppPath(), "assets", "file-explorer.html"));
+  void explorerView.webContents.loadFile(explorerUrl);
 }
 
 function focusMainWindow(): void {
@@ -202,6 +299,8 @@ function focusMainWindow(): void {
 
 function onServerStatus(status: ServerStatus, url?: string): void {
   logger.info(`server status -> ${status}${url ? ` (${url})` : ""}`);
+  // Keep the IPC allowlist in step with the port the server actually chose.
+  setWebViewOrigin(url);
   if (tray) tray.updateStatus(status, url);
 
   if (status === "running" && url) {
@@ -209,30 +308,39 @@ function onServerStatus(status: ServerStatus, url?: string): void {
       void waitForReady(url)
         .then(() => createWindow(url))
         .catch((error) => showError(String(error)));
-    } else if (dshView) {
-      const current = dshView.webContents.getURL();
-      if (!current.startsWith(url)) void dshView.webContents.loadURL(url);
+      return;
+    }
+    // Capture the view: the window's `closed` handler nulls the module binding,
+    // so a stale reference here would crash the main process.
+    const view = dshView;
+    if (view && !view.webContents.isDestroyed()) {
+      const current = view.webContents.getURL();
+      if (current === "" || !current.startsWith(url)) void view.webContents.loadURL(url);
     }
   }
 }
 
 function registerExplorerUiIpc(): void {
-  ipcMain.handle("dsh-explorer:toggle", () => {
+  ipcMain.handle("dsh-explorer:toggle", (event) => {
+    guardFilePage(event);
     explorerCollapsed = !explorerCollapsed;
     layout();
     return {
       collapsed: explorerCollapsed,
-      width: explorerCollapsed ? COLLAPSED_WIDTH : explorerWidth,
+      width: effectiveExplorerWidth(),
     };
   });
 
-  ipcMain.handle("dsh-explorer:set-width", (_event, px: number) => {
+  ipcMain.handle("dsh-explorer:set-width", (event, px: number) => {
+    guardFilePage(event);
     if (typeof px === "number" && Number.isFinite(px)) {
       explorerWidth = Math.min(MAX_EXPLORER_WIDTH, Math.max(MIN_EXPLORER_WIDTH, Math.round(px)));
       if (explorerCollapsed) explorerCollapsed = false;
     }
     layout();
-    return { collapsed: explorerCollapsed, width: explorerWidth };
+    // Report the width that was actually applied, not the requested one, so the
+    // renderer's drag baseline cannot drift from the real layout.
+    return { collapsed: explorerCollapsed, width: effectiveExplorerWidth() };
   });
 }
 
@@ -285,6 +393,9 @@ if (!gotLock) {
   app.whenReady().then(() => {
     initLogger();
     Menu.setApplicationMenu(null);
+    // The explorer's default browse root is the user's home; permit it before
+    // any renderer can ask, so the first listing never races the allowlist.
+    allowRoot(app.getPath("home"));
     registerLogIpc();
     registerSettingsIpc();
     registerFileExplorerIpc();
@@ -303,6 +414,8 @@ if (!gotLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    disposeWebBridge?.();
+    disposeWebBridge = null;
     serverManager?.stop();
   });
 }

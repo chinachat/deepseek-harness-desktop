@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { app } from "electron";
 import fs from "node:fs";
@@ -17,6 +17,8 @@ const URL_PATTERN = /dsh web: (http:\/\/127\.0\.0\.1:\d+)/;
 const BOOT_TIMEOUT_MS = 90_000;
 const RESTART_DELAY_MS = 3_000;
 const MAX_CONSECUTIVE_RESTARTS = 3;
+/** Uptime that credits a launch as "stable" and resets the crash budget. */
+const STABLE_UPTIME_MS = 60_000;
 
 function resolveDshBin(): string {
   const candidates = [
@@ -38,6 +40,8 @@ export class DshServerManager extends EventEmitter {
   private consecutiveFailures = 0;
   private bootTimer: NodeJS.Timeout | undefined;
   private restartTimer: NodeJS.Timeout | undefined;
+  /** When the current child last reported its URL, for stable-uptime accounting. */
+  private startedAt: number | undefined;
   /** Monotonic epoch bumped on every (re)start so stale async callbacks become no-ops. */
   private epoch = 0;
   /** Reused in-flight `start()` promise while a launch is in progress (dedupes concurrent starts). */
@@ -92,6 +96,11 @@ export class DshServerManager extends EventEmitter {
       logger.warn(`dsh patch overlay not found: ${patchFile}`);
     }
     args.push("--host", "127.0.0.1", "--port", "0");
+    // The desktop shell already renders the UI in its own view. Without this,
+    // dsh hands the authenticated URL to the OS default browser on every start
+    // (and on every crash restart), opening a duplicate tab that carries the
+    // session token.
+    args.push("--no-open");
 
     const child = spawn(process.execPath, args, {
       env: {
@@ -106,6 +115,8 @@ export class DshServerManager extends EventEmitter {
     return new Promise<string>((resolve, reject) => {
       let stdoutBuf = "";
       let settled = false;
+      /** Set when this launch's failure was already recorded by another path. */
+      let countedExit = false;
 
       // A callback is only authoritative for its own launch epoch. When a newer
       // launch has superseded this one (stop/restart), ignore it entirely.
@@ -114,6 +125,14 @@ export class DshServerManager extends EventEmitter {
       this.bootTimer = setTimeout(() => {
         if (!isCurrent() || settled) return;
         settled = true;
+        // A bounded process owns an unbounded resource: if the URL never
+        // arrives, tear the child down. Otherwise it keeps running untracked
+        // while scheduleRestart spawns a second server, and neither stop() nor
+        // before-quit can reach it.
+        this.killChild(child, "boot timeout");
+        // This failure is already being handled here, so the exit event that
+        // the kill produces must not count it a second time.
+        countedExit = true;
         this.handleFailure(new Error(`dsh web did not print its URL within ${BOOT_TIMEOUT_MS}ms`));
         reject(new Error(`dsh web did not print its URL within ${BOOT_TIMEOUT_MS}ms`));
       }, BOOT_TIMEOUT_MS);
@@ -126,7 +145,7 @@ export class DshServerManager extends EventEmitter {
         if (match && isCurrent() && !settled) {
           settled = true;
           if (this.bootTimer) clearTimeout(this.bootTimer);
-          this.consecutiveFailures = 0;
+          this.startedAt = Date.now();
           this.setStatus("running", match[1]);
           resolve(match[1]);
         }
@@ -140,6 +159,7 @@ export class DshServerManager extends EventEmitter {
         this.emit("output", "stderr", `spawn error: ${String(error)}\n`);
         if (!isCurrent() || settled) return;
         settled = true;
+        countedExit = true;
         if (this.bootTimer) clearTimeout(this.bootTimer);
         this.handleFailure(error);
         reject(error);
@@ -151,19 +171,58 @@ export class DshServerManager extends EventEmitter {
         this.emit("exit", code, signal);
         if (!isCurrent()) return;
         this.child = undefined;
-        if (!settled) {
-          settled = true;
-          this.handleFailure(new Error(`dsh exited before the web server was ready (code=${code})`));
-          reject(new Error(`dsh exited before the web server was ready (code=${code})`));
+
+        if (this.stoppedByUs) {
+          this.setStatus("stopped");
           return;
         }
-        if (!this.stoppedByUs) {
-          this.scheduleRestart();
-        } else {
-          this.setStatus("stopped");
+
+        // A launch that reached "running" but died soon after is a crash loop
+        // just as much as one that never booted, so it counts against the same
+        // budget. A launch that ran for a healthy stretch is credited as stable.
+        const uptime = this.startedAt === undefined ? 0 : Date.now() - this.startedAt;
+        this.startedAt = undefined;
+        const stable = uptime >= STABLE_UPTIME_MS;
+
+        if (stable) {
+          this.consecutiveFailures = 0;
+        } else if (!countedExit) {
+          this.consecutiveFailures += 1;
         }
+
+        if (!settled) {
+          settled = true;
+          const message = `dsh exited before the web server was ready (code=${code})`;
+          logger.error(`dsh server failure: ${message}`);
+          this.setStatus("error");
+          reject(new Error(message));
+          this.scheduleRestart();
+          return;
+        }
+
+        this.scheduleRestart();
       });
     });
+  }
+
+  /**
+   * Terminate the dsh child and its descendants.
+   *
+   * `child.kill()` signals only the direct child; on Windows the spawned shell
+   * and tool subprocesses survive as an orphaned tree. `taskkill /T` is the
+   * only way to take the whole tree down there.
+   */
+  private killChild(child: ChildProcessWithoutNullStreams | undefined, reason: string): void {
+    if (!child || child.exitCode !== null || child.killed) return;
+    logger.info(`killing dsh process tree (${reason})`);
+    if (process.platform === "win32" && child.pid !== undefined) {
+      const result = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+      });
+      if (result.error === undefined) return;
+      logger.warn(`taskkill unavailable (${String(result.error)}); falling back to child.kill()`);
+    }
+    child.kill();
   }
 
   private handleFailure(error: Error): void {
@@ -174,6 +233,9 @@ export class DshServerManager extends EventEmitter {
 
   private scheduleRestart(): void {
     this.setStatus("error");
+    // Never stack restart attempts: an exit arriving while one is already
+    // pending must not queue a second launch.
+    if (this.restartTimer) return;
     if (this.consecutiveFailures > MAX_CONSECUTIVE_RESTARTS) {
       logger.error(`dsh crashed ${this.consecutiveFailures} times consecutively; giving up`);
       return;
@@ -199,10 +261,7 @@ export class DshServerManager extends EventEmitter {
     }
     const child = this.child;
     this.child = undefined;
-    if (child && !child.killed) {
-      logger.info("stopping dsh");
-      child.kill();
-    }
+    this.killChild(child, "stop");
     this.pendingStart = undefined;
     this.currentUrl = undefined;
     this.setStatus("stopped");
@@ -221,9 +280,8 @@ export class DshServerManager extends EventEmitter {
     }
     const child = this.child;
     this.child = undefined;
-    if (child && !child.killed) {
-      child.kill();
-    }
+    this.killChild(child, "manual restart");
+    this.startedAt = undefined;
     this.pendingStart = undefined;
     this.currentUrl = undefined;
     this.consecutiveFailures = 0;

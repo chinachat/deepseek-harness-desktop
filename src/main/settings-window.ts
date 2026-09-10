@@ -2,6 +2,7 @@ import { BrowserWindow, ipcMain } from "electron";
 import { app } from "electron";
 import path from "node:path";
 import { applyGithubProxy, getSettings, saveSettings, type AppSettings } from "./settings";
+import { guardFilePage } from "./ipc-guard";
 import { UpdateManager, type UpdateState } from "./updater";
 
 let settingsWindow: BrowserWindow | null = null;
@@ -11,11 +12,13 @@ let settingsWindow: BrowserWindow | null = null;
  * talks to the main process through `settings-preload.js`.
  */
 export function registerSettingsIpc(): void {
-  ipcMain.handle("settings:get", (): AppSettings => {
+  ipcMain.handle("settings:get", (event): AppSettings => {
+    guardFilePage(event);
     return getSettings();
   });
 
-  ipcMain.handle("settings:set", (_event, patch: Partial<AppSettings>): AppSettings => {
+  ipcMain.handle("settings:set", (event, patch: Partial<AppSettings>): AppSettings => {
+    guardFilePage(event);
     const next = saveSettings(patch ?? {});
     if (typeof patch?.githubProxy === "string") {
       applyGithubProxy(next.githubProxy);
@@ -24,21 +27,25 @@ export function registerSettingsIpc(): void {
     return next;
   });
 
-  ipcMain.handle("updater:state", () => {
+  ipcMain.handle("updater:state", (event) => {
+    guardFilePage(event);
     return UpdateManager.get().getState();
   });
 
-  ipcMain.handle("updater:version", () => {
+  ipcMain.handle("updater:version", (event) => {
+    guardFilePage(event);
     return UpdateManager.get().currentVersion();
   });
 
-  ipcMain.handle("updater:check", async () => {
+  ipcMain.handle("updater:check", async (event) => {
+    guardFilePage(event);
     const settings = getSettings();
     await UpdateManager.get().check(settings.githubProxy);
     return UpdateManager.get().getState();
   });
 
-  ipcMain.handle("updater:install", () => {
+  ipcMain.handle("updater:install", (event) => {
+    guardFilePage(event);
     UpdateManager.get().quitAndInstall();
     return true;
   });
@@ -61,6 +68,9 @@ export function openSettingsWindow(): void {
       preload: path.join(__dirname, "..", "preload", "settings-preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Left off deliberately: the preload is compiled to CommonJS and has not
+      // been verified under a sandboxed preload environment, and a silent
+      // bridge failure here would break the settings window outright.
       sandbox: false,
     },
   });

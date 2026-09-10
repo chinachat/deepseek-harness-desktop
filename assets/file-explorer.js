@@ -91,19 +91,44 @@
     return (n / 1048576).toFixed(1) + " MB";
   }
   function scheme(u) {
+    // A single-letter scheme is a Windows drive letter ("C:/x"), i.e. a local
+    // path, not a URL scheme.
     var m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(u);
-    return m ? m[1].toLowerCase() : null;
+    if (!m || m[1].length === 1) return null;
+    return m[1].toLowerCase();
   }
   function safeUrl(u) {
+    // Protocol-relative ("//host/x") inherits the document's scheme and navigates
+    // off-origin; without a window-open policy that is an escape primitive.
+    if (/^\/\//.test(u)) return "#";
     var s = scheme(u);
     if (s && s !== "http" && s !== "https" && s !== "mailto") return "#";
     return u;
   }
   function safeImgUrl(u) {
+    if (/^\/\//.test(u)) return "#";
     var s = scheme(u);
     if (s && s !== "http" && s !== "https" && s !== "data") return "#";
     if (s === "data" && !/^data:image\//i.test(u)) return "#";
     return u;
+  }
+
+  /* ---------- fenced code blocks ---------- */
+  /**
+   * Detect an opening code fence. A fence is THREE OR MORE backticks, so a
+   * document can nest a shorter fence inside a longer one (````md … ``` … ````),
+   * which is exactly how a model renders a markdown example.
+   *
+   * Returns the backtick-run length and the info string, or null. The fenced
+   * body is closed by a run of at least the same length, so nesting round-trips.
+   */
+  function fenceOpen(line) {
+    var m = /^(`{3,})([^`]*)$/.exec(String(line));
+    if (!m) return null;
+    return { ticks: m[1].length, info: m[2].trim() };
+  }
+  function fenceCloseRe(ticks) {
+    return new RegExp("^`{" + ticks + ",}\\s*$");
   }
 
   /* ---------- 代码高亮 ---------- */
@@ -254,12 +279,13 @@
     var i = 0;
     while (i < lines.length) {
       var line = lines[i];
-      var fence = /^```(\w*)\s*$/.exec(line);
+      var fence = fenceOpen(line);
       if (fence) {
-        var lang = fenceLang(fence[1]);
+        var lang = fenceLang(fence.info.split(/\s+/)[0] || "");
+        var closeRe = fenceCloseRe(fence.ticks);
         var buf = [];
         i++;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+        while (i < lines.length && !closeRe.test(lines[i])) { buf.push(lines[i]); i++; }
         i++;
         var code = buf.join("\n");
         out.push('<pre><code>' + highlightCode(code, lang) + '</code></pre>');
@@ -317,9 +343,15 @@
       }
       if (/^\s*$/.test(line)) { i++; continue; }
       var para = [];
+      var start = i;
       while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,6}\s|```|>|\s*[-*+]\s|\s*\d+[.)]\s)/.test(lines[i]) && !/^\s*([-*_])\s*(?:\1\s*){2,}$/.test(lines[i])) {
         para.push(lines[i]); i++;
       }
+      // Progress guarantee. The predicates above reject a line as "block-level"
+      // more eagerly than the branches consume one, so a line can match no
+      // branch at all and leave `i` frozen -- which spins this loop forever and
+      // exhausts the heap. Consume such an orphan line unconditionally.
+      if (i === start) { para.push(lines[start]); i++; }
       out.push('<p>' + inline(para.join(" ")) + '</p>');
     }
     return out.join("");

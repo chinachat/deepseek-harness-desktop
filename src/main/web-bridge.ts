@@ -1,6 +1,8 @@
 import { app, dialog, ipcMain, type WebContents } from "electron";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
+import { guardWebView } from "./ipc-guard";
 
 /**
  * In-page capabilities injected into the dsh web view (main world) that the
@@ -25,7 +27,13 @@ import path from "node:path";
  * convenience feature instead of breaking startup.
  */
 
-const DRIVE_PROBE_INTERVAL_MS = 500;
+const MAX_PICKED_IMAGE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Fallback sweep interval for the injected script. DOM mutations drive the
+ * sweep; this only covers a missed or unavailable MutationObserver.
+ */
+const INJECT_SWEEP_INTERVAL_MS = 2000;
 
 /** Image file extensions accepted by the dsh image attachment pipeline. */
 const IMAGE_TYPES: Record<string, string> = {
@@ -50,6 +58,48 @@ export interface WebBridgeDeps {
 const PAGE_SENTINEL = "__dshDesktopBridgeInstalled";
 
 /**
+ * `cwd` of the most recently written session record, or `null`.
+ *
+ * Reads only the newest candidate first and stops at the first record that
+ * carries a usable `cwd`, so the common case is a single small file read.
+ * Subagent sessions are stored in the same directory and may lack a `cwd`;
+ * they are simply skipped rather than treated as the active workspace.
+ */
+function mostRecentSessionCwd(sessionsDir: string): string | null {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(sessionsDir);
+  } catch {
+    return null;
+  }
+
+  const candidates: { file: string; mtime: number }[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(sessionsDir, name);
+    try {
+      candidates.push({ file, mtime: fs.statSync(file).mtimeMs });
+    } catch {
+      /* vanished mid-scan */
+    }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+
+  for (const { file } of candidates.slice(0, 8)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+        record?: { identity?: { cwd?: unknown } };
+      };
+      const cwd = parsed?.record?.identity?.cwd;
+      if (typeof cwd === "string" && cwd.trim() !== "") return path.resolve(cwd);
+    } catch {
+      /* unreadable or partially written; try the next newest */
+    }
+  }
+  return null;
+}
+
+/**
  * Windows drive roots, e.g. `["C:\\", "D:\\"]`. Mirrors the enumeration used by
  * the explorer IPC; kept local so the bridge has no cross-module coupling.
  */
@@ -69,57 +119,37 @@ function listWindowsDrives(): string[] {
 }
 
 /**
- * Active workspace root from the persisted dsh session registry.
+ * Active workspace root, read from dsh's live session store.
  *
  * Priority:
- *  1. The most recently active session's `cwd` (session_projcache.json →
- *     tables.sessions.<id>.identity.cwd, ranked by
- *     sessionListMetadata.lastPromptAt) — this tracks the conversation the
- *     user is currently working in.
- *  2. Fallback: the most recently updated workspace (workspace.json →
- *     tables.workspaces.<id>.path by updatedAt).
+ *  1. The most recently *written* session record's `cwd`
+ *     (`storages/session_projcache/sessions/<id>.json` →
+ *     `record.identity.cwd`, ranked by file mtime). dsh rewrites this file on
+ *     every persisted session change, so mtime is genuine activity — unlike
+ *     `lastPromptAt`, which only moves when the user submits a prompt and so
+ *     goes stale as soon as a session is continued, switched, or resumed.
+ *  2. Fallback: the most recently updated workspace (`workspace.json` →
+ *     `tables.workspaces.<id>.path` by `updatedAt`).
+ *
+ * The aggregate `session_projcache.json` is deliberately NOT consulted: it is
+ * written on a slower cadence and can lag the per-session files, which is what
+ * made the explorer pin to a stale workspace.
  */
 function readWorkspaceRoot(): string | null {
   const home = app.getPath("home");
+  // Honour DSH_HOME the same way dsh itself resolves its state directory;
+  // otherwise a relocated state dir makes this probe silently useless.
+  const configured = process.env.DSH_HOME?.trim();
+  const dshHome = configured ? configured : path.join(home, ".dsh");
+  const storages = path.join(dshHome, "storages");
 
-  // 1. Most recently active session's cwd.
-  try {
-    const file = path.join(home, ".dsh", "storages", "session_projcache.json");
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
-      tables?: {
-        sessions?: Record<
-          string,
-          {
-            identity?: { cwd?: unknown };
-            rows?: {
-              sessionListMetadata?: { val?: { lastPromptAt?: unknown } };
-            };
-          }
-        >;
-      };
-    };
-    const sessions = parsed?.tables?.sessions ?? {};
-    let bestCwd: string | null = null;
-    let bestActive = -1;
-    for (const id of Object.keys(sessions)) {
-      const s = sessions[id];
-      const cwd = s?.identity?.cwd;
-      if (typeof cwd !== "string" || cwd === "") continue;
-      const t = Date.parse(String(s?.rows?.sessionListMetadata?.val?.lastPromptAt ?? ""));
-      const ts = Number.isFinite(t) ? t : 0;
-      if (bestCwd === null || ts > bestActive) {
-        bestCwd = cwd;
-        bestActive = ts;
-      }
-    }
-    if (bestCwd) return path.resolve(bestCwd);
-  } catch {
-    /* fall through to workspace registry */
-  }
+  // 1. Most recently written session record.
+  const root = mostRecentSessionCwd(path.join(storages, "session_projcache", "sessions"));
+  if (root) return root;
 
   // 2. Most recently updated workspace.
   try {
-    const file = path.join(home, ".dsh", "storages", "workspace.json");
+    const file = path.join(storages, "workspace.json");
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
       tables?: { workspaces?: Record<string, { path?: unknown; updatedAt?: unknown }> };
     };
@@ -158,7 +188,8 @@ let ipcRegistered = false;
 function registerImagePickerIpc(): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
-  ipcMain.handle("dsh-desktop:pick-images", async () => {
+  ipcMain.handle("dsh-desktop:pick-images", async (event) => {
+    guardWebView(event);
     const result = await dialog.showOpenDialog({
       properties: ["openFile", "multiSelections"],
       filters: IMAGE_FILTERS,
@@ -170,7 +201,11 @@ function registerImagePickerIpc(): void {
         const ext = path.extname(filePath).toLowerCase();
         const type = IMAGE_TYPES[ext];
         if (!type) continue;
-        const buf = fs.readFileSync(filePath);
+        // The dialog's filter is a suggestion, not an enforcement point, and an
+        // unbounded read is base64-expanded (+33%) and shipped over IPC twice.
+        const st = await fsp.stat(filePath);
+        if (!st.isFile() || st.size > MAX_PICKED_IMAGE_BYTES) continue;
+        const buf = await fsp.readFile(filePath);
         picked.push({
           name: path.basename(filePath),
           type,
@@ -184,10 +219,19 @@ function registerImagePickerIpc(): void {
   });
 }
 
-export function installWebBridge(dshView: WebContents, explorerView: WebContents, deps: WebBridgeDeps = {}): void {
+/**
+ * Install the dsh-page bridge and return a disposer.
+ *
+ * Every timer and listener registered here belongs to the calling window, so
+ * the caller must dispose it when that window closes; otherwise a recreated
+ * window stacks another poll and another `did-finish-load` listener on top of
+ * the stale ones.
+ */
+export function installWebBridge(dshView: WebContents, explorerView: WebContents, deps: WebBridgeDeps = {}): () => void {
   registerImagePickerIpc();
 
   const pushDrives = () => {
+    if (dshView.isDestroyed()) return;
     const drives = listWindowsDrives();
     void dshView
       .executeJavaScript(`window.__dshDesktopDrives = ${json(drives)};`)
@@ -197,6 +241,7 @@ export function installWebBridge(dshView: WebContents, explorerView: WebContents
   };
 
   const inject = () => {
+    if (dshView.isDestroyed()) return;
     pushDrives();
     void dshView.executeJavaScript(INSTALL_SCRIPT).catch(() => {
       /* page not ready yet */
@@ -217,8 +262,13 @@ export function installWebBridge(dshView: WebContents, explorerView: WebContents
       explorerView.send("dsh-explorer:workspace-root", root);
     }
   };
-  setInterval(probe, 1000);
+  const probeTimer = setInterval(probe, 1000);
   probe();
+
+  return () => {
+    clearInterval(probeTimer);
+    dshView.removeListener("did-finish-load", inject);
+  };
 }
 
 /**
@@ -276,9 +326,13 @@ const INSTALL_SCRIPT = `
   }
 
   function ensureDriveDropdown() {
+    if (document.getElementById(DRIVE_DROPDOWN_ID)) return true;
+    return decorateDriveDropdown();
+  }
+
+  function decorateDriveDropdown() {
     const dialog = document.querySelector(".ZuhsRW_dialog");
     if (!dialog) return false;
-    if (document.getElementById(DRIVE_DROPDOWN_ID)) return true;
     const header = dialog.querySelector(".ZuhsRW_header");
     if (!header) return false;
 
@@ -309,11 +363,16 @@ const INSTALL_SCRIPT = `
     sel.addEventListener("change", () => {
       if (sel.value) navigateToPath(sel.value);
     });
-    header.appendChild(sel);
+    // React owns .ZuhsRW_header and removes the children it knows about. A node
+    // React never created either leaks on the next reconciliation or makes its
+    // removeChild throw NotFoundError, which can blank the surrounding UI.
+    // Tag the node so "still attached" is verifiable, and never append twice.
+    sel.setAttribute("data-dsh-desktop", "drive-select");
+    const stale = header.querySelector('[data-dsh-desktop="drive-select"]');
+    if (stale && stale !== sel) stale.remove();
+    if (!header.contains(sel)) header.appendChild(sel);
     return true;
   }
-
-  setInterval(ensureDriveDropdown, ${DRIVE_PROBE_INTERVAL_MS});
 
   // ---- image picker button ------------------------------------------
   // dsh web ingests images only via drag-drop/paste (document-level handlers).
@@ -390,10 +449,68 @@ const INSTALL_SCRIPT = `
       e.stopPropagation();
       onPickImage();
     });
-    anchor.parentElement.appendChild(btn);
+    // Same React-owned container as the drive selector: never append twice and
+    // never leave an untracked node behind for reconciliation to trip over.
+    btn.setAttribute("data-dsh-desktop", "pick-image");
+    const wrap = anchor.parentElement;
+    const stale = wrap.querySelector('[data-dsh-desktop="pick-image"]');
+    if (stale && stale !== btn) stale.remove();
+    if (!wrap.contains(btn)) wrap.appendChild(btn);
     return true;
   }
 
-  setInterval(ensurePickButton, ${DRIVE_PROBE_INTERVAL_MS});
+  // Sweep on DOM change (React re-renders are what remove our nodes) with a
+  // slow fallback tick, instead of polling at the old 500ms.
+  let sweepQueued = false;
+  function scheduleSweep() {
+    if (sweepQueued) return;
+    sweepQueued = true;
+    setTimeout(() => {
+      sweepQueued = false;
+      try {
+        ensureDriveDropdown();
+      } catch (_) { /* upstream DOM changed; the next sweep retries */ }
+      try {
+        ensurePickButton();
+      } catch (_) { /* upstream DOM changed; the next sweep retries */ }
+    }, 50);
+  }
+
+  // Only react to mutations that are actually relevant. The dsh page streams
+  // text while a model responds, so a blanket subtree observer would schedule a
+  // sweep for every token. React adding a node only matters when a node we own
+  // is gone; removals matter when we own the removed node.
+  function relevant(mutations) {
+    for (const m of mutations) {
+      const added = m.addedNodes;
+      for (let i = 0; i < added.length; i++) {
+        if (added[i] && added[i].nodeType === 1 && gone(added[i])) return true;
+      }
+      const removed = m.removedNodes;
+      for (let i = 0; i < removed.length; i++) {
+        const node = removed[i];
+        if (!node || node.nodeType !== 1) continue;
+        if (node.id === PICK_BTN_ID || node.id === DRIVE_DROPDOWN_ID) return true;
+        if (node.querySelector && node.querySelector('[data-dsh-desktop]')) return true;
+      }
+    }
+    return false;
+  }
+  function gone(node) {
+    if (node.closest && node.closest('[data-dsh-desktop]')) return false;
+    return true;
+  }
+
+  // React 的 DOM 变动是我们需要重挂节点的主因，因此由 MutationObserver 驱动，
+  // 外加一个低频兜底扫描，取代原先 500ms 的固定轮询。
+  try {
+    new MutationObserver((mutations) => {
+      if (relevant(mutations)) scheduleSweep();
+    }).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  } catch (_) { /* the fallback interval below still covers it */ }
+  setInterval(scheduleSweep, ${INJECT_SWEEP_INTERVAL_MS});
 })();
 `;
