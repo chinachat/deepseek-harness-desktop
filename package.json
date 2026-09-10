@@ -64,6 +64,7 @@
     "productName": "DeepSeek Harness",
     "asar": false,
     "npmRebuild": false,
+    "artifactName": "DeepSeek-Harness-Setup-${version}.${ext}",
     "directories": {
       "output": "release",
       "buildResources": "build"
