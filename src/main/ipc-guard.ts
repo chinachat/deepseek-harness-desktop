@@ -22,7 +22,6 @@ import { pathToFileURL } from "node:url";
 
 /** `file://` pages shipped in the app bundle that may invoke privileged IPC. */
 const FILE_PAGE_ALLOWLIST = [
-  "file-explorer.html",
   "settings.html",
   "log-viewer.html",
 ];

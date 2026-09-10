@@ -1,5 +1,9 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge } from "electron";
 
+/**
+ * The dsh web UI needs no host bridge any more: it uploads attachments and picks
+ * workspace directories natively, so this preload only reports runtime facts.
+ */
 contextBridge.exposeInMainWorld("dshDesktop", {
   platform: process.platform,
   versions: {
@@ -7,5 +11,4 @@ contextBridge.exposeInMainWorld("dshDesktop", {
     chrome: process.versions.chrome,
     node: process.versions.node,
   },
-  pickImages: () => ipcRenderer.invoke("dsh-desktop:pick-images"),
 });
