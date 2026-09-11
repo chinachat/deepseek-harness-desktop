@@ -51,23 +51,25 @@
   DetailPrint "  DeepSeek Harness - 安装前检查"
   DetailPrint "=================================================="
 
-  ; Windows version via ntdll!RtlGetVersion, which - unlike GetVersionEx - is
-  ; not affected by the compatibility shims that report 6.2 on Windows 10+.
-  ; RTL_OSVERSIONINFOW's five DWORD fields are contiguous, so a single 20-byte
-  ; read reaches dwBuildNumber.
-  ; NOTE: LogicLib is NOT loaded yet at this point in electron-builder's header,
-  ; so this macro must use plain NSIS instructions instead of ${If}.
-  System::Call 'ntdll::RtlGetVersion(p .r0) i .r1'
-  System::Call '*$0(&i4, &i4, &i4, &i4, &i4)'
-  Pop $R0 ; dwOSVersionInfoSize
-  Pop $R1 ; dwMajorVersion
-  Pop $R2 ; dwMinorVersion
-  Pop $R3 ; dwBuildNumber
-  DetailPrint "[检查] Windows 版本 : $R1.$R2 (build $R3)"
+  ; Windows version via kernel32!GetVersion, decoded by hand.
+  ;
+  ; Deliberately NOT ntdll!RtlGetVersion with a struct read. The form
+  ;   System::Call '*$0(&i4, &i4, &i4, &i4, &i4)'
+  ; with bare &iN targets pushes NOTHING onto the stack, so the Pops that
+  ; followed ran on an empty stack; the resulting misalignment crashed the whole
+  ; installer at startup with 0xC0000005 (access violation) before any UI
+  ; appeared. Every System::Call below uses explicit output registers (.rN),
+  ; which never touch the stack.
+  System::Call 'kernel32::GetVersion() i .r0'
+  IntOp $R1 $R0 & 0x000000FF
+  IntOp $R2 $R0 & 0x0000FF00
+  IntOp $R2 $R2 >> 8
+  DetailPrint "[检查] Windows 版本 : $R1.$R2"
 
-  System::Call 'kernel32::GetCurrentProcess() p .r4'
-  System::Call 'kernel32::IsWow64Process(p r4, *i .r5) i .r6'
-  StrCmp $R5 "1" dsh_ci_64
+  ; 64-bit or 32-bit: IsWow64Process reports FALSE from a 32-bit process.
+  System::Call 'kernel32::GetCurrentProcess() p .r3'
+  System::Call 'kernel32::IsWow64Process(p r3, *i .r4) i .r5'
+  StrCmp $R4 "1" dsh_ci_64
     DetailPrint "[检查] 进程架构    : 32 位"
     Goto dsh_ci_arch_done
   dsh_ci_64:
@@ -75,15 +77,15 @@
   dsh_ci_arch_done:
 
   ; Free space on the target volume. FileFunc.nsh is not in this include chain,
-  ; so ask kernel32 directly; GetDiskFreeSpaceExW writes uint64, hence *l.
+  ; so ask kernel32 directly; GetDiskFreeSpaceExW writes uint64, hence *l .rN.
   StrCmp $INSTDIR "" 0 dsh_ci_have_dir
     StrCpy $INSTDIR "$SYSDIR"
   dsh_ci_have_dir:
-  System::Call 'kernel32::GetDiskFreeSpaceExW(w "$INSTDIR", *l .r7, *l .r8, *l .r9) i .r0'
-  StrCmp $R0 "0" dsh_ci_space_unknown
-    System::Int64Op $R7 / 1048576
-    Pop $R1
-    DetailPrint "[检查] 目标盘可用  : $R1 MB"
+  System::Call 'kernel32::GetDiskFreeSpaceExW(w "$INSTDIR", *l .r6, *l .r7, *l .r8) i .r9'
+  StrCmp $R9 "0" dsh_ci_space_unknown
+    System::Int64Op $R6 / 1048576
+    Pop $R0
+    DetailPrint "[检查] 目标盘可用  : $R0 MB"
     Goto dsh_ci_space_done
   dsh_ci_space_unknown:
     DetailPrint "[检查] 目标盘可用  : 读取失败（已跳过）"
@@ -96,22 +98,22 @@
   ; pass, and an unguarded reference becomes warning 6000, which
   ; electron-builder escalates to a hard build error.
   ClearErrors
+  StrCpy $R1 ""
   StrCpy $R2 ""
-  StrCpy $R3 ""
   !ifdef UNINSTALL_REGISTRY_KEY
-    ReadRegStr $R2 SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" "DisplayVersion"
+    ReadRegStr $R1 SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" "DisplayVersion"
   !endif
   !ifdef INSTALL_REGISTRY_KEY
-    ReadRegStr $R3 SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" "InstallLocation"
+    ReadRegStr $R2 SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" "InstallLocation"
   !endif
-  StrCmp $R2 "" dsh_ci_no_prev
-    DetailPrint "[检查] 旧版本      : 检测到 $R2，安装时将自动移除"
+  StrCmp $R1 "" dsh_ci_no_prev
+    DetailPrint "[检查] 旧版本      : 检测到 $R1，安装时将自动移除"
     Goto dsh_ci_prev_dir
   dsh_ci_no_prev:
     DetailPrint "[检查] 旧版本      : 未检测到（全新安装）"
   dsh_ci_prev_dir:
-  StrCmp $R3 "" dsh_ci_prev_done
-    DetailPrint "[检查] 旧安装位置  : $R3"
+  StrCmp $R2 "" dsh_ci_prev_done
+    DetailPrint "[检查] 旧安装位置  : $R2"
   dsh_ci_prev_done:
 
   DetailPrint "--------------------------------------------------"
