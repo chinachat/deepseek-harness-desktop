@@ -1,6 +1,7 @@
 import { app } from "electron";
 import fs from "node:fs";
 import path from "node:path";
+import { redactSecrets } from "./redact";
 
 let logDir = "";
 
@@ -39,7 +40,10 @@ function rotate(logPath: string): void {
 }
 
 function write(level: string, message: string): void {
-  const line = `[${new Date().toISOString()}] [${level}] ${message}\n`;
+  // Redact here rather than at each call site: the log file is the durable copy
+  // of everything that passes through, and dsh's own stdout (which carries the
+  // `?token=…` announce line) is logged verbatim through this same door.
+  const line = `[${new Date().toISOString()}] [${level}] ${redactSecrets(message)}\n`;
   if (logDir) {
     try {
       const logPath = path.join(logDir, "dsh-desktop.log");

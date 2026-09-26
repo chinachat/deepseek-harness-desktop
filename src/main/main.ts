@@ -6,9 +6,10 @@ import { DshServerManager, type ServerStatus } from "./dsh-server";
 import { createTray, TrayState } from "./tray";
 import { openLogWindow, registerLogIpc } from "./log-window";
 import { openSettingsWindow, registerSettingsIpc } from "./settings-window";
-import { guardFilePage, setWebViewOrigin } from "./ipc-guard";
+import { getWebViewOrigin, guardFilePage, setWebViewOrigin } from "./ipc-guard";
 import { UpdateManager } from "./updater";
 import { applyLaunchAtLogin, getSettings, saveSettings, type AppSettings } from "./settings";
+import { publicUrl, redactSecrets } from "./redact";
 
 let mainWindow: BrowserWindow | null = null;
 let dshView: WebContentsView | null = null;
@@ -22,8 +23,12 @@ let lastThemeDark: boolean | undefined;
 const HEALTH_TIMEOUT_MS = 30_000;
 
 function showError(message: string): void {
-  logger.error(message);
-  dialog.showErrorBox("DeepSeek Harness 启动失败", message);
+  // This is the one place where text reaches the screen without going through
+  // the logger, so redact here too: an error raised while talking to the dsh
+  // server can quote its token-bearing URL.
+  const safe = redactSecrets(message);
+  logger.error(safe);
+  dialog.showErrorBox("DeepSeek Harness 启动失败", safe);
   app.quit();
 }
 
@@ -34,6 +39,14 @@ function originOf(url: string): string {
   } catch {
     return "";
   }
+}
+
+/** Hostnames that mean "the machine we started the server on". */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+/** True for the plain-HTTP loopback URLs the dsh server is allowed to use. */
+function isLoopback(url: URL): boolean {
+  return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
 }
 
 /**
@@ -57,7 +70,23 @@ function isReady(url: string, cookie?: string, redirectsLeft = 3): Promise<boole
       const location = res.headers.location;
       const setCookie = res.headers["set-cookie"]?.[0]?.split(";")[0];
       if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
-        resolve(isReady(new URL(location, url).href, setCookie ?? cookie, redirectsLeft - 1));
+        let next: URL;
+        try {
+          next = new URL(location, url);
+        } catch {
+          resolve(false);
+          return;
+        }
+        // Only ever replay the session cookie — and the token in the URL — to
+        // the loopback server we started ourselves. dsh redirects within its own
+        // origin, so anything else is a server that should not be trusted with
+        // the credential.
+        if (!isLoopback(next)) {
+          logger.warn(`refusing to follow a readiness redirect off loopback: ${next.origin}`);
+          resolve(false);
+          return;
+        }
+        resolve(isReady(next.href, setCookie ?? cookie, redirectsLeft - 1));
         return;
       }
       resolve(status === 200);
@@ -76,7 +105,9 @@ async function waitForReady(url: string): Promise<void> {
     if (await isReady(url)) return;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  throw new Error(`web UI did not become ready at ${url}`);
+  // `error.message` reaches both the log and a modal dialog, so it must not
+  // carry the token.
+  throw new Error(`web UI did not become ready at ${publicUrl(url)}`);
 }
 
 function layout(): void {
@@ -189,10 +220,12 @@ function createWindow(url: string): void {
     },
   });
 
-  const dshOrigin = new URL(url).origin;
-
-  // The dsh view may only ever show the local server it was started for.
-  hardenView(dshView, (target) => target.origin === dshOrigin, "dsh view");
+  // The dsh view may only ever show the local server it was started for. The
+  // allowed origin is read live from `ipc-guard` rather than captured here: dsh
+  // takes a fresh port on every restart, so a value captured at window creation
+  // would keep rejecting the new origin — and hand the token-bearing URL to the
+  // system browser through the "external link" path below.
+  hardenView(dshView, (target) => target.origin === getWebViewOrigin(), "dsh view");
   recoverOnCrash(dshView, "dsh view", () => {
     // Reload the announced URL, token included, so recovery does not depend on
     // a session cookie surviving the crash.
@@ -261,7 +294,9 @@ function focusMainWindow(): void {
 }
 
 function onServerStatus(status: ServerStatus, url?: string): void {
-  logger.info(`server status -> ${status}${url ? ` (${url})` : ""}`);
+  // Log the origin, not the announce URL: the query carries the session token
+  // and this line ends up in dsh-desktop.log.
+  logger.info(`server status -> ${status}${url ? ` (${publicUrl(url)})` : ""}`);
   // Keep the IPC allowlist in step with the port the server actually chose.
   setWebViewOrigin(url);
   if (tray) tray.updateStatus(status, url);

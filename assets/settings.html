@@ -116,8 +116,8 @@
 
 <div class="card">
   <h2>GitHub 代理(用于在线升级)</h2>
-  <input type="text" id="proxy" placeholder="http://127.0.0.1:7890(留空为直连)">
-  <div class="hint">升级包从 GitHub Releases 下载;网络受限时可配置本地代理(Clash / v2ray 等)地址。</div>
+  <input type="text" id="proxy" placeholder="http://127.0.0.1:7890(留空则跟随系统代理)">
+  <div class="hint">升级包从 GitHub Releases 下载;网络受限时可配置本地代理(Clash / v2ray 等)地址;留空则跟随系统代理设置,而不是强制直连。</div>
   <div class="row" style="justify-content: flex-end;">
     <button id="save">保存设置</button>
   </div>

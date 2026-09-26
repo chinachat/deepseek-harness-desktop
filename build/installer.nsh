@@ -162,6 +162,17 @@
 ; ----------------------------------------------------------------------------
 !macro customUnInit
   Call un.dshMaybePurgeFunc
+  ; initMultiUser ran immediately above this hook and set the shell context from
+  ; $installMode; the probe switched it to `current` to read the per-user
+  ; %APPDATA%. Put it back, or the uninstall section's shortcut cleanup resolves
+  ; $DESKTOP / $SMPROGRAMS against the wrong profile (visible on per-machine
+  ; installs as orphaned Start-menu entries).
+  StrCmp $installMode "all" 0 dsh_ctx_current
+    SetShellVarContext all
+    Goto dsh_ctx_done
+  dsh_ctx_current:
+    SetShellVarContext current
+  dsh_ctx_done:
 !macroend
 
 Function un.dshMaybePurgeFunc
@@ -186,17 +197,54 @@ Function un.dshMaybePurgeFunc
   Pop $R0
   StrCmp $R0 "" 0 dsh_purge_no
 
+  ; --- locate the user data directory ---------------------------------------
+  ; Electron computes userData as `%APPDATA%\<package.json name>` unless the
+  ; packaged manifest carries a top-level `productName`. This one does not — only
+  ; electron-builder's `build.productName` is set, and electron-builder never
+  ; injects it into the packaged package.json — so the directory is
+  ; `%APPDATA%\dsh-desktop`, i.e. `${APP_PACKAGE_NAME}`. Probing
+  ; `${APP_FILENAME}` (which this file overrides to the INSTALL FOLDER name) can
+  ; never match, which is why the prompt never appeared.
+  ;
+  ; The candidates probed here are exactly the ones the template's own
+  ; --delete-app-data block removes, so "the directory we offered to delete" and
+  ; "the directory the template deletes" cannot drift apart.
+  ;
+  ; Each label sits INSIDE the same !ifdef as the branch that jumps to it. The
+  ; APP_PRODUCT_FILENAME define is normally absent: electron-builder only emits
+  ; it when the APP_FILENAME it computed differs from productFilename, and the
+  ; override below happens in this include, after electron-builder has already
+  ; decided. A label referenced from inside an !ifdef but defined outside it is
+  ; "warning 6012: label not used", and electron-builder treats warnings as
+  ; errors — so the structure matters, not just the behavior.
   SetShellVarContext current
-  StrCpy $R1 "$APPDATA\${APP_FILENAME}"
-  IfFileExists "$R1\*.*" 0 dsh_purge_no
+  StrCpy $R1 ""
+  !ifdef APP_PACKAGE_NAME
+    IfFileExists "$APPDATA\${APP_PACKAGE_NAME}\*.*" 0 dsh_probe_product
+      StrCpy $R1 "$APPDATA\${APP_PACKAGE_NAME}"
+      Goto dsh_probe_done
+    dsh_probe_product:
+  !endif
+  !ifdef APP_PRODUCT_FILENAME
+    IfFileExists "$APPDATA\${APP_PRODUCT_FILENAME}\*.*" 0 dsh_probe_install
+      StrCpy $R1 "$APPDATA\${APP_PRODUCT_FILENAME}"
+      Goto dsh_probe_done
+    dsh_probe_install:
+  !endif
+  IfFileExists "$APPDATA\${APP_FILENAME}\*.*" 0 dsh_probe_done
+    StrCpy $R1 "$APPDATA\${APP_FILENAME}"
+  dsh_probe_done:
+  StrCmp $R1 "" dsh_purge_no
 
   MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 \
     "是否同时删除用户数据？$\r$\n$\r$\n$R1$\r$\n$\r$\n包含设置、日志、会话缓存等。$\r$\n选择「否」会保留这些数据，以后重新安装可继续使用。" \
     /SD IDNO IDNO dsh_purge_no
 
-  ; Fall-through means Yes: hand the decision to the template's own parser,
-  ; which runs later in the uninstall section. Appending to $CMDLINE works
-  ; because NSIS user variables are unbounded strings.
+  ; Fall-through means Yes: hand the decision to the template's own parser, which
+  ; runs later in the uninstall section and removes every candidate directory
+  ; (APP_FILENAME, APP_PRODUCT_FILENAME, APP_PACKAGE_NAME) rather than only the
+  ; one we showed. Appending to $CMDLINE works because NSIS user variables are
+  ; unbounded strings.
   StrCpy $R2 "$CMDLINE"
   StrCpy $CMDLINE "$R2 --delete-app-data"
   Goto dsh_purge_end

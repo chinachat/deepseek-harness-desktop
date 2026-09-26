@@ -10,9 +10,11 @@ import { logger } from "./logger";
  * - Update feed: `latest.yml` published on
  *   `https://github.com/chinachat/deepseek-harness-desktop/releases` (the
  *   `publish.github` config in package.json).
- * - Proxy: a GitHub proxy configured in settings is applied to the process
- *   environment before every check, so Node's `https` (used by
- *   electron-updater through `proxy-from-env`) routes through it.
+ * - Proxy: a GitHub proxy configured in settings is applied to the
+ *   `electron-updater` session that `ElectronHttpExecutor` performs its
+ *   requests in (see `applyGithubProxy` in `./settings`, and note that the
+ *   request does not go through Node's `https`, so environment variables such
+ *   as `HTTPS_PROXY` would have no effect).
  *
  * The class owns the single autoUpdater instance and re-broadcasts its events
  * with stable, UI-friendly payloads.
@@ -84,8 +86,12 @@ export class UpdateManager extends EventEmitter {
 
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
-    // Allow pre-releases so the updater can see rc/beta channel builds too.
-    autoUpdater.allowPrerelease = true;
+    // Prereleases stay OFF. The GitHub provider honours this flag, and this
+    // project has shipped a prerelease that could not launch at all (v0.1.8,
+    // 0xC0000005 at installer startup): with the flag on, every installed copy
+    // would have been offered that build. A beta channel, if one is ever
+    // wanted, belongs behind an explicit opt-in rather than on by default.
+    autoUpdater.allowPrerelease = false;
 
     // This project ships unsigned installers (no code-signing certificate).
     // electron-updater's NSIS verifier would reject the downloaded installer as

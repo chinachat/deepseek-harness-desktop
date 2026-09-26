@@ -48,7 +48,8 @@ npm run pack
 
 - **升级源**：`https://github.com/chinachat/deepseek-harness-desktop/releases`（`publish.github` 配置）。
 - **检查方式**：托盘「设置…」→「检查更新」，或直接打开设置窗口。下载进度实时显示，下载完成后可一键重启安装。
-- **代理配置**：网络受限时，在设置窗口填写 GitHub 代理（如 `http://127.0.0.1:7890`）即可，升级请求会经该代理走 GitHub。
+- **代理配置**：网络受限时，在设置窗口填写 GitHub 代理（如 `http://127.0.0.1:7890`）即可。代理会应用到 `electron-updater` 自己使用的会话（`session.fromPartition("electron-updater")`），也就是升级请求实际经过的通道——`defaultSession` 和 `HTTPS_PROXY` 对它都无效。**留空表示跟随系统代理**（默认行为），而不是强制直连：如果你的代理是通过系统代理生效的（Clash / v2ray 常见做法），留空即可。
+- **预发布版本**：`allowPrerelease` 为 `false`，客户端只接收正式版，避免再次把无法启动的预发布包推送给存量用户。
 - **发布新版本**：打标签发布时，用 `GH_TOKEN` 环境变量将产物上传到 GitHub Releases：
 
   ```bash
@@ -89,19 +90,22 @@ build/           # 打包资源（应用图标、NSIS 自定义脚本）
 - **peerDependencies 补齐**：electron-builder 默认不打包 peer 依赖，已将 dsh 运行时需要的 `@deepseek-ai/*` peer 包显式加入 `dependencies`（含 `picker-browse.patch.yml` 引用的两个 browse 插件包）。
 - **进程树清理**：重启/退出时用 `taskkill /T` 结束 dsh 及其全部子进程，避免留下孤儿服务。
 - **日志轮转**：`dsh-desktop.log` 超过 5MB 时保留最近 2000 行，不会无限增长。
+- **上游版本**：内置运行时为 `@deepseek-ai/dsh` 0.1.5-rc.3。两个上游耦合点已按该版本核对：`dsh web:` 启动横幅格式，以及 `assets/picker-browse.patch.yml` 依赖的 `directory-picker` 行 id。`scripts/patch-dsh-win32.mjs` 的两处锚点同样按该版本核对，且脚本现在要求锚点**唯一命中**，命中 0 处或多处都会让 `npm install` 直接失败而不是静默漏打。
 
 ## 安全模型
 
-桌面壳把宿主能力收敛在三个边界上，改动 IPC 时请一并维护：
+桌面壳把宿主能力收敛在四个边界上，改动 IPC 时请一并维护：
 
 1. **发送方校验**：`ipcMain.handle` 是进程级注册，任何能触达 `ipcRenderer` 的渲染进程都能调用。因此 `src/main/ipc-guard.ts` 要求每个 handler 校验 `event.senderFrame`：`settings:*` / `updater:*` / `logs:read` 只接受来自应用自身 `file://` 页面的顶层 frame。仅靠 preload 的 `contextBridge` 作用域**不构成**边界——它是按 `webPreferences` 而非 URL 安装的。
-2. **导航与开窗**：dsh 视图只允许停留在本次启动的 loopback 来源，其余一律拦截并交给系统浏览器打开；`setWindowOpenHandler` 拒绝在应用内新建窗口。
+2. **导航与开窗**：dsh 视图只允许停留在本次启动的 loopback 来源，其余一律拦截并交给系统浏览器打开；`setWindowOpenHandler` 拒绝在应用内新建窗口。允许的 origin 由 `ipc-guard` 单一持有（`setWebViewOrigin` / `getWebViewOrigin`），dsh 重启换端口后导航白名单会跟着更新，不会把带 token 的地址当外链交给系统浏览器。就绪探测（`isReady`）同样只跟随 loopback 重定向，不会把会话 cookie 交给其它主机。
 3. **不再持有文件能力**：资源管理器移除后，宿主不再注册任何 `dsh-fs:*` / `dsh-explorer:*` 通道，也不再向 dsh 页面注入脚本，因此不存在「宿主代理文件访问」这一攻击面。三个本地页面都带 CSP；dsh 视图使用独立会话分区（`persist:dsh-web`）。
+4. **凭据不落盘、不上屏**：dsh 每次启动都会签发新的 session token，并把界面播报为 `http://127.0.0.1:<port>/?token=…`。该 token 可换取签名 cookie，等价于对 agent（可执行 shell）的控制权，因此 `src/main/redact.ts` 在写日志前统一脱敏——包括 dsh 自身 stdout 的转发——托盘只显示 origin、不显示 query。新增任何打印或展示 URL 的代码时请复用 `publicUrl()` / `redactSecrets()`。
 
 ## 已知限制
 
 - **更新链路无代码签名**：安装包未签名，`electron-updater` 的签名校验被显式跳过（见 `src/main/updater.ts`），完整性只靠 `latest.yml` 里的 SHA-512，而它与安装包同源。要消除风险需要给安装包签名；否则请把可配置的 GitHub 代理当作更新链路的信任组成部分。
 - **`wasm`/原生模块构建**：`@deepseek-ai/dsh-subprocess-local`、`koffi`、`node-pty` 带 install script。`npm ci` 默认可能不执行它们；从零 clone 后若要使用原生目录选择器或终端功能，需要 `npm approve-scripts`（本仓库默认走 browse 后端，因此不影响正常启动）。
+- **userData 目录名**：打包后的 `package.json` 没有顶层 `productName`（只有 electron-builder 的 `build.productName`，Electron 看不到），所以 `app.getPath("userData")` 是 `%APPDATA%\dsh-desktop`（取自 `name`），而不是 `%APPDATA%\DeepSeek Harness`。卸载时的「是否删除用户数据」按该目录探测；将来若补上顶层 `productName`，必须同步更新 `build/installer.nsh` 的候选目录列表，否则这个提示会再次静默失效。
 - **发布产物的文件名必须与 `latest.yml` 一致**：`electron-updater` 由 `latest.yml` 的 `path` 推导下载地址（仅把空格换成连字符），而 GitHub 会把上传资产名里的空格规范成点号。因此 `package.json` 固定了 `artifactName`（无空格）；改动它时请同时确认三者一致，否则自动更新会 404。
 
 ## License

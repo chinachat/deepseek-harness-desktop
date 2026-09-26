@@ -7,6 +7,11 @@
 # packaged Electron, surfacing as "win32 folder dialog worker exited before
 # reporting a result". The browse interaction is pure JavaScript (in-app
 # directory browser) and works everywhere.
+#
+# Verified against @deepseek-ai/dsh-web-app 0.1.5-rc.3: its cordis.patch.yml
+# still mounts this seam as row id `directory-picker`
+# (name `@deepseek-ai/dsh-host-directory-picker-auto`), and both browse packages
+# below still exist at that version.
 - id: directory-picker
   disabled: true
 - insert:

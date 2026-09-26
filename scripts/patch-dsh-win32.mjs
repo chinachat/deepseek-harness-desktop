@@ -14,6 +14,9 @@
  *
  * This runs from `postinstall`, so a fresh `npm install` reproduces the fix.
  * Upstream fix to prefer: pass CREATE_NO_WINDOW in the library itself.
+ *
+ * Anchors verified against @deepseek-ai/dsh-win32-process 0.1.5-rc.3
+ * (`lib/index.js`): one call site each, still without CREATE_NO_WINDOW.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -69,11 +72,23 @@ let patched = original;
 const applied = [];
 
 for (const { from, to } of EDIT) {
-  if (!patched.includes(from)) {
-    if (patched.includes(to)) continue; // already patched
+  if (patched.includes(to)) continue; // already patched
+  // `String.prototype.replace` rewrites only the first match, so an ambiguous
+  // anchor would leave later call sites flashing a console window while the
+  // script still reported success. Require exactly one occurrence, and fail
+  // loudly (breaking `npm install`) when upstream reshapes the file.
+  const occurrences = patched.split(from).length - 1;
+  if (occurrences === 0) {
     fail(
       `pattern not found: ${JSON.stringify(from.slice(0, 70))}. ` +
         `Upstream ${TARGET_PACKAGE} changed; update scripts/patch-dsh-win32.mjs.`
+    );
+    continue;
+  }
+  if (occurrences > 1) {
+    fail(
+      `pattern is ambiguous (${occurrences} matches): ${JSON.stringify(from.slice(0, 70))}. ` +
+        `Narrow it in scripts/patch-dsh-win32.mjs so every call site is patched deliberately.`
     );
     continue;
   }

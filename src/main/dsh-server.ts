@@ -4,6 +4,7 @@ import { app } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { logger } from "./logger";
+import { redactSecrets } from "./redact";
 
 export type ServerStatus = "starting" | "running" | "stopped" | "error";
 
@@ -149,7 +150,11 @@ export class DshServerManager extends EventEmitter {
 
       child.stdout.on("data", (chunk: Buffer) => {
         const text = chunk.toString();
-        this.emit("output", "stdout", text);
+        // dsh announces itself on stdout as `dsh web: http://…?token=<secret>`,
+        // and this stream is forwarded to the log. Scrub before it leaves this
+        // process; the token itself is still kept in `match[1]` below, because
+        // it is the handle the view has to load.
+        this.emit("output", "stdout", redactSecrets(text));
         stdoutBuf += text;
         const match = URL_PATTERN.exec(stdoutBuf);
         if (match && isCurrent() && !settled) {
@@ -226,7 +231,11 @@ export class DshServerManager extends EventEmitter {
     if (!child || child.exitCode !== null || child.killed) return;
     logger.info(`killing dsh process tree (${reason})`);
     if (process.platform === "win32" && child.pid !== undefined) {
-      const result = spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      // Resolve taskkill by absolute path: a bare name is looked up on PATH,
+      // and the agent's own shell can prepend to PATH.
+      const systemRoot = process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows";
+      const systemTaskkill = path.join(systemRoot, "System32", "taskkill.exe");
+      const result = spawnSync(fs.existsSync(systemTaskkill) ? systemTaskkill : "taskkill", ["/pid", String(child.pid), "/T", "/F"], {
         windowsHide: true,
       });
       if (result.error === undefined) return;

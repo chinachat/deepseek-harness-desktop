@@ -2,6 +2,7 @@ import { app, Menu, Tray, nativeImage } from "electron";
 import path from "node:path";
 import type { ServerStatus } from "./dsh-server";
 import type { AppSettings } from "./settings";
+import { publicUrl } from "./redact";
 
 export interface TrayState {
   tray: Tray;
@@ -88,9 +89,13 @@ export function createTray(actions: TrayActions): TrayState {
   return {
     tray,
     updateStatus: (status: ServerStatus, url?: string) => {
-      statusItem.label = url ? `${STATUS_LABEL[status]} (${url})` : STATUS_LABEL[status];
+      // Never surface the query: the announce URL carries the session token,
+      // and the tray label and tooltip are exactly what ends up in screenshots
+      // and screen shares. The origin is what a user actually needs to see.
+      const shown = publicUrl(url);
+      statusItem.label = shown ? `${STATUS_LABEL[status]} (${shown})` : STATUS_LABEL[status];
       tray.setContextMenu(buildMenu());
-      tray.setToolTip(url ? `DeepSeek Harness\n${url}` : "DeepSeek Harness");
+      tray.setToolTip(shown ? `DeepSeek Harness\n${shown}` : "DeepSeek Harness");
     },
     refreshSettings: (next: AppSettings) => {
       loginItem.checked = next.launchAtLogin;
